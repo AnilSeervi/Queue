@@ -1,0 +1,24 @@
+{
+	"configurations": [
+		{
+			"type": "swift",
+			"request": "launch",
+			"args": [],
+			"cwd": "${workspaceFolder:github-toolbar}",
+			"name": "Debug Queue",
+			"target": "Queue",
+			"configuration": "debug",
+			"preLaunchTask": "swift: Build Debug Queue"
+		},
+		{
+			"type": "swift",
+			"request": "launch",
+			"args": [],
+			"cwd": "${workspaceFolder:github-toolbar}",
+			"name": "Release Queue",
+			"target": "Queue",
+			"configuration": "release",
+			"preLaunchTask": "swift: Build Release Queue"
+		}
+	]
+}

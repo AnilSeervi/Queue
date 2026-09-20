@@ -1,0 +1,30 @@
+name: Release
+
+# Push a tag like v0.1.0 → builds Queue.app, zips it, and attaches it to a
+# GitHub release with generated notes.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Queue.app
+        run: QUEUE_VERSION="${GITHUB_REF_NAME#v}" bash scripts/bundle.sh release
+
+      - name: Zip (ditto preserves the bundle structure)
+        run: ditto -c -k --keepParent build/Queue.app "Queue-${GITHUB_REF_NAME}.zip"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "Queue-${GITHUB_REF_NAME}.zip" \
+            --title "Queue $GITHUB_REF_NAME" \
+            --generate-notes
