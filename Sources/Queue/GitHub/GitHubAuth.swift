@@ -42,6 +42,30 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
 
     // MARK: - AuthProvider
 
+    /// Personal access token path: no OAuth app or client ID needed. The token
+    /// is stored first (the client reads it from the Keychain), validated with
+    /// GET /user, and removed again if GitHub rejects it. A PAT has no refresh
+    /// token, so any stale one from a previous OAuth sign-in is cleared.
+    func signIn(withToken token: String) async throws -> String {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw GitHubError.api("Paste a token first.") }
+        Keychain.delete(account: Keychain.refreshTokenAccount)
+        guard Keychain.save(trimmed) else {
+            throw GitHubError.api("Could not store the token in the Keychain.")
+        }
+        do {
+            let login = try await fetchLogin()
+            UserDefaults.standard.set(login, forKey: "githubLogin")
+            return login
+        } catch {
+            Keychain.delete()
+            if let gitHubError = error as? GitHubError, gitHubError.isAuthError {
+                throw GitHubError.api("GitHub rejected that token. Check it was copied in full and hasn't expired.")
+            }
+            throw error
+        }
+    }
+
     func startDeviceFlow() async throws -> DeviceFlowInfo {
         let clientID = try Self.clientID()
         let payload = try await postForm(

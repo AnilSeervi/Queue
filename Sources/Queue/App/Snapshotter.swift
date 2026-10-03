@@ -37,6 +37,10 @@ enum Snapshotter {
             state.auth = .pickingRepos(MockData.watchableRepos)
             snap(PanelRootView().environmentObject(state), dark: true,
                  to: url.appendingPathComponent("onboarding-step2.png"))
+            state.tokenEntryActive = true
+            snap(PanelRootView().environmentObject(state), dark: true,
+                 to: url.appendingPathComponent("onboarding-token.png"))
+            state.tokenEntryActive = false
             state.auth = savedAuth
 
             // Menu bar icon states (both appearances).

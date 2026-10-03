@@ -151,4 +151,11 @@ final class MockAuthProvider: AuthProvider {
         return "rdejong"
     }
     func fetchWatchableRepos() async throws -> [WatchableRepo] { MockData.watchableRepos }
+    func signIn(withToken token: String) async throws -> String {
+        try await Task.sleep(nanoseconds: 600_000_000)
+        guard !token.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw GitHubError.api("Paste a token first.")
+        }
+        return "rdejong"
+    }
 }

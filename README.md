@@ -13,7 +13,7 @@ xattr -dr com.apple.quarantine /Applications/Queue.app
 open /Applications/Queue.app
 ```
 
-Then follow [Live mode](#live-mode) below to sign in.
+Then sign in — the quickest route is a personal access token (see [Live mode](#live-mode)).
 
 ## Build & run
 
@@ -48,7 +48,11 @@ QUEUE_SNAPSHOT=<dir> …                      # render every surface to PNGs and
 
 ### Live mode
 
-Queue signs in with the GitHub OAuth **device flow**: the panel shows a code, you authorize it in the browser, done. One-time developer setup — create a GitHub OAuth app (github.com/settings/developers; **enable Device Flow** on it) and provide its client ID:
+Two ways to sign in, both on the sign-in card:
+
+**Personal access token — no setup.** Click *Use a personal access token instead*, hit *Create token on GitHub* (opens the classic-token form with `repo` and `read:org` prefilled), generate it, paste it, and sign in. Tokens without an expiry never need renewing; if you set one, Queue returns to the sign-in card when it lapses.
+
+**Device flow — one-time developer setup.** The panel shows a code, you authorize it in the browser, done. Create a GitHub OAuth app (github.com/settings/developers; **enable Device Flow** on it) and provide its client ID:
 
 ```sh
 defaults write com.queueapp.Queue githubClientID <your-client-id>
@@ -56,7 +60,9 @@ defaults write com.queueapp.Queue githubClientID <your-client-id>
 QUEUE_GITHUB_CLIENT_ID=<your-client-id> ./build/Queue.app/Contents/MacOS/Queue
 ```
 
-Tokens live in your Keychain (`com.queueapp.Queue`), never on disk or in logs. Scopes: `repo read:org` (approve/merge need the classic `repo` scope). OAuth apps with "Expire user authorization tokens" enabled work out of the box — the refresh token is stored and access tokens auto-renew on 401.
+OAuth apps with "Expire user authorization tokens" enabled work out of the box — the refresh token is stored and access tokens auto-renew on 401.
+
+Either way, the token lives in your Keychain (`com.queueapp.Queue`), never on disk or in logs. Scopes: `repo read:org` (approve/merge need the classic `repo` scope).
 
 Dev-build note: the bundle is ad-hoc signed, so macOS asks for Keychain access once per rebuild ("Always Allow" holds for that build). A real signing identity (Apple Development certificate) makes it permanent.
 

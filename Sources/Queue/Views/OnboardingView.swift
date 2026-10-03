@@ -35,6 +35,10 @@ struct OnboardingView: View {
 
     var body: some View {
         ZStack {
+            if state.tokenEntryActive {
+                TokenStepView()
+                    .transition(.opacity)
+            } else {
             switch state.auth {
             case .signedOut:
                 SignInStepView(info: nil)
@@ -49,12 +53,14 @@ struct OnboardingView: View {
             case .signedIn:
                 EmptyView() // PanelRootView won't show onboarding then.
             }
+            }
         }
         .padding(OB.cardPadding)
         .frame(width: OB.cardWidth)
         .background(OB.cardBackground)
         .environment(\.colorScheme, .dark) // spec 1e: onboarding is always dark
         .animation(OB.crossfade, value: stepIndex)
+        .animation(OB.crossfade, value: state.tokenEntryActive)
     }
 
     /// settings.watchedRepos ∩ repos; fallback: first 3.
@@ -170,6 +176,17 @@ private struct SignInStepView: View {
                 }
                 .padding(.top, 10)
             }
+
+            Button {
+                state.showTokenEntry()
+            } label: {
+                Text("Use a personal access token instead")
+                    .font(OB.footnoteFont.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.7))
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 14)
         }
     }
 
@@ -185,6 +202,124 @@ private struct SignInStepView: View {
             guard generation == copyGeneration else { return }
             withAnimation(.easeOut(duration: 0.12)) { copied = false }
         }
+    }
+}
+
+// MARK: - Alternative — Personal access token
+
+private struct TokenStepView: View {
+    @EnvironmentObject var state: AppState
+    @State private var token = ""
+    @FocusState private var fieldFocused: Bool
+
+    /// Classic-token form prefilled with the scopes Queue needs.
+    private static let createURL = URL(string: "https://github.com/settings/tokens/new?scopes=repo,read:org&description=Queue")!
+
+    private var canSubmit: Bool {
+        !token.trimmingCharacters(in: .whitespaces).isEmpty && !state.isSigningInWithToken
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PRGlyph(color: .white, size: 28, lineWidth: 1.8)
+
+            Text("Use an access token")
+                .font(DSFont.onboardingTitle())
+                .foregroundStyle(.white)
+                .padding(.top, 14)
+
+            Text("Create a classic token with the repo and read:org scopes, then paste it below.")
+                .font(DSFont.onboardingBody())
+                .foregroundStyle(Color.white.opacity(0.55))
+                .multilineTextAlignment(.center)
+                .padding(.top, 6)
+
+            // Secondary: opens GitHub's new-token form with scopes prefilled.
+            Button {
+                state.open(Self.createURL)
+            } label: {
+                Text("Create token on GitHub")
+                    .font(OB.primaryButtonFont)
+                    .foregroundStyle(.white)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 14)
+
+            // Token field + Paste fallback (works without a ⌘V menu path).
+            HStack(spacing: 8) {
+                SecureField("ghp_…", text: $token)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .focused($fieldFocused)
+                    .onSubmit(submit)
+                Button {
+                    if let pasted = NSPasteboard.general.string(forType: .string) {
+                        token = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                } label: {
+                    Text("Paste")
+                        .font(OB.footnoteFont.weight(.semibold))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(EdgeInsets(top: 9, leading: 10, bottom: 9, trailing: 10))
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            )
+            .padding(.top, 10)
+
+            Button(action: submit) {
+                Text(state.isSigningInWithToken ? "Signing in…" : "Sign in")
+                    .font(OB.primaryButtonFont)
+                    .foregroundStyle(Color(hex: 0x1D1D1F))
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .opacity(canSubmit ? 1 : 0.5)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSubmit)
+            .padding(.top, 10)
+
+            if let error = state.tokenError {
+                Text(error)
+                    .font(OB.footnoteFont)
+                    .foregroundStyle(Color(hex: 0xFF7369))
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 10)
+            }
+
+            Text("Stored in your Keychain only.")
+                .font(OB.footnoteFont)
+                .foregroundStyle(Color.white.opacity(0.35))
+                .padding(.top, 12)
+
+            Button {
+                state.showCodeEntry()
+            } label: {
+                Text("Sign in with a code instead")
+                    .font(OB.footnoteFont.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.7))
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 14)
+        }
+        .onAppear { fieldFocused = true }
+    }
+
+    private func submit() {
+        guard canSubmit else { return }
+        let value = token
+        token = ""   // never keep the secret in view state longer than needed
+        state.signInWithToken(value)
     }
 }
 

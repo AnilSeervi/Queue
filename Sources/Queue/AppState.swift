@@ -27,12 +27,17 @@ protocol AuthProvider {
     func waitForSignIn() async throws -> String
     /// Repos in the configured org the user can watch (onboarding step 2).
     func fetchWatchableRepos() async throws -> [WatchableRepo]
+    /// Validate a personal access token, store it (Keychain), return the login.
+    func signIn(withToken token: String) async throws -> String
     /// Clear stored credentials (Keychain token, cached login).
     func signOut()
 }
 
 extension AuthProvider {
     func signOut() {}
+    func signIn(withToken token: String) async throws -> String {
+        throw GitHubError.api("Token sign-in isn't available.")
+    }
 }
 
 // MARK: - Settings
@@ -132,6 +137,13 @@ final class AppState: ObservableObject {
 
     var authProvider: AuthProvider?
     private var pendingUsername: String?
+    /// The in-flight device-flow task, cancelled when switching to token entry.
+    private var signInTask: Task<Void, Never>?
+
+    // Token sign-in (alternative to the device flow).
+    @Published var tokenEntryActive = false
+    @Published var isSigningInWithToken = false
+    @Published var tokenError: String?
     private var refreshTimer: Timer?
     private var rerunResetTasks: [String: Task<Void, Never>] = [:]
 
@@ -377,7 +389,7 @@ final class AppState: ObservableObject {
         guard let provider = authProvider else { return }
         if case .signedOut = auth {} else { return }
         inlineError = nil
-        Task {
+        signInTask = Task {
             do {
                 let info = try await provider.startDeviceFlow()
                 auth = .deviceFlow(info)
@@ -387,9 +399,47 @@ final class AppState: ObservableObject {
                 startRefreshTimer()
                 await refresh()
             } catch {
+                // Cancelled = the user switched to token entry; not a failure.
+                if Task.isCancelled { return }
                 inlineError = "Sign-in failed — \(error.localizedDescription)"
                 auth = .signedOut
             }
+            onStateChange?()
+        }
+    }
+
+    /// Switch the sign-in card to personal-access-token entry.
+    func showTokenEntry() {
+        signInTask?.cancel()
+        signInTask = nil
+        if case .deviceFlow = auth { auth = .signedOut }
+        inlineError = nil
+        tokenError = nil
+        tokenEntryActive = true
+    }
+
+    /// Back to the device-flow code (the card restarts the flow on appear).
+    func showCodeEntry() {
+        tokenError = nil
+        tokenEntryActive = false
+    }
+
+    /// Validate + store a personal access token, then go straight in.
+    func signInWithToken(_ token: String) {
+        guard let provider = authProvider, !isSigningInWithToken else { return }
+        isSigningInWithToken = true
+        tokenError = nil
+        Task {
+            do {
+                let login = try await provider.signIn(withToken: token)
+                auth = .signedIn(username: login)
+                tokenEntryActive = false
+                startRefreshTimer()
+                await refresh()
+            } catch {
+                tokenError = error.localizedDescription
+            }
+            isSigningInWithToken = false
             onStateChange?()
         }
     }
@@ -419,6 +469,7 @@ final class AppState: ObservableObject {
 
     func signOut() {
         authProvider?.signOut()
+        tokenEntryActive = false
         auth = .signedOut
         inbox = []; prs = []; issues = []; stats = nil; repoCI = []
         onStateChange?()
