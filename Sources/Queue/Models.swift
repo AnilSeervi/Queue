@@ -141,6 +141,9 @@ struct MyPR: Identifiable, Hashable {
     var requiredApprovals: Int
     var age: Age
     var url: URL
+    /// Logins (and team names) review has been requested from.
+    var requestedReviewers: [String] = []
+    var isDraft = false
 
     var meta: String { "#\(number) · \(branch)" }
     var isReady: Bool {
@@ -195,22 +198,59 @@ struct AssignedIssue: Identifiable, Hashable {
 // MARK: - Stats
 
 struct DayActivity: Identifiable, Hashable {
-    var id: Int          // 0…6, Monday-first
-    var label: String    // "M" "T" "W" "T" "F" "S" "S"
-    var value: Int       // reviews + merges that day
+    var id: Int          // 0…6, oldest → today
+    var label: String    // weekday initial, "M" "T" …
+    var value: Int       // GitHub contributions that day
     var isToday: Bool
     var isWeekend: Bool
 }
 
+/// API-backed numbers for the Stats tab. Review-queue aging and "your PRs
+/// waiting" are derived live from the inbox / PR lists instead, so they track
+/// snoozes and this session's approvals.
 struct StatsData: Hashable {
-    var waitingOnYou: Int
-    var waitingOnOthers: Int
-    var reviewTurnaround: String     // "4h 32m"
-    var checksPassRate: Int          // 91  (%)
-    var oldestWaiting: String        // "3d"
-    var oldestWaitingContext: String // "Jira sync #388"
+    // This week: the last 7 days, from GitHub's contribution data.
     var reviewsThisWeek: Int
+    var prsOpenedThisWeek: Int
+    var prsMergedThisWeek: Int
     var activity: [DayActivity]
+    var streakDays: Int
+    // Turnaround + CI.
+    /// Median time from opening to first review, over your recently merged PRs.
+    var medianFirstReview: TimeInterval?
+    var firstReviewSample: Int
+    /// Share of conclusive check runs that passed on your open PRs.
+    var checksPassRate: Int?
+    var mostFailingCheck: String?
+    var mostFailingCount: Int
+}
+
+/// "45m", "4h 32m", "2d 3h".
+func formatDuration(_ interval: TimeInterval) -> String {
+    let minutes = max(1, Int(interval / 60))
+    if minutes < 60 { return "\(minutes)m" }
+    let hours = minutes / 60
+    if hours < 24 { return minutes % 60 == 0 ? "\(hours)h" : "\(hours)h \(minutes % 60)m" }
+    let days = hours / 24
+    return hours % 24 == 0 ? "\(days)d" : "\(days)d \(hours % 24)h"
+}
+
+/// Last 7 days ending today, weekday initials, from a date → count lookup.
+func lastSevenDays(counts: (Date) -> Int) -> [DayActivity] {
+    let calendar = Calendar.current
+    let today = calendar.startOfDay(for: Date())
+    let initials = ["S", "M", "T", "W", "T", "F", "S"]   // Calendar weekday 1 = Sunday
+    return (0..<7).map { index in
+        let day = calendar.date(byAdding: .day, value: index - 6, to: today)!
+        let weekday = calendar.component(.weekday, from: day)
+        return DayActivity(
+            id: index,
+            label: initials[weekday - 1],
+            value: counts(day),
+            isToday: index == 6,
+            isWeekend: weekday == 1 || weekday == 7
+        )
+    }
 }
 
 // MARK: - Footer CI strip
@@ -266,7 +306,8 @@ enum BadgeStyle: String, CaseIterable, Codable {
 
 enum StatusIconState: Hashable {
     case allClear
-    case needsYouCount(Int)
+    /// Count badge; `ciFailing` adds the red dot alongside the number.
+    case needsYouCount(Int, ciFailing: Bool)
     case needsYouDot
     case ciFailing          // red pulsing dot, overrides count
     case snoozed

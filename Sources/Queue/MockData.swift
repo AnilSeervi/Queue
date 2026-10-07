@@ -60,7 +60,8 @@ enum MockData {
             MyPR(id: "pr-4830", repo: itsmCore, number: 4830,
                  title: "Rate-limit audit log exports", branch: "feat/audit-rate-limit",
                  ci: .running(pill: nil), approvals: 1, requiredApprovals: 2,
-                 age: Age(date: ago(hours: 3)), url: prURL(itsmCore, 4830)),
+                 age: Age(date: ago(hours: 3)), url: prURL(itsmCore, 4830),
+                 requestedReviewers: ["tkole"]),
             MyPR(id: "pr-2215", repo: webClient, number: 2215,
                  title: "Dark mode for request detail pane", branch: "feat/detail-dark-mode",
                  ci: .passing, approvals: 2, requiredApprovals: 2,
@@ -68,7 +69,8 @@ enum MockData {
             MyPR(id: "pr-391", repo: integrations, number: 391,
                  title: "Retry queue for webhook deliveries", branch: "fix/webhook-retry",
                  ci: .failing(context: "lint failed"), approvals: 0, requiredApprovals: 2,
-                 age: Age(date: ago(hours: 8)), url: prURL(integrations, 391)),
+                 age: Age(date: ago(hours: 2, days: 2)), url: prURL(integrations, 391),
+                 requestedReviewers: ["pdeboer", "asmit"]),
         ]
     }
 
@@ -94,20 +96,17 @@ enum MockData {
     }
 
     static var stats: StatsData {
-        StatsData(
-            waitingOnYou: 4, waitingOnOthers: 3,
-            reviewTurnaround: "4h 32m", checksPassRate: 91,
-            oldestWaiting: "3d", oldestWaitingContext: "Jira sync #388",
-            reviewsThisWeek: 12,
-            activity: [
-                DayActivity(id: 0, label: "M", value: 5, isToday: false, isWeekend: false),
-                DayActivity(id: 1, label: "T", value: 2, isToday: false, isWeekend: false),
-                DayActivity(id: 2, label: "W", value: 6, isToday: false, isWeekend: false),
-                DayActivity(id: 3, label: "T", value: 3, isToday: false, isWeekend: false),
-                DayActivity(id: 4, label: "F", value: 5, isToday: true, isWeekend: false),
-                DayActivity(id: 5, label: "S", value: 0, isToday: false, isWeekend: true),
-                DayActivity(id: 6, label: "S", value: 0, isToday: false, isWeekend: true),
-            ])
+        let values = [5, 2, 6, 3, 0, 1, 4]
+        return StatsData(
+            reviewsThisWeek: 12, prsOpenedThisWeek: 4, prsMergedThisWeek: 3,
+            activity: lastSevenDays { day in
+                let offset = Calendar.current.dateComponents([.day], from: day, to: Calendar.current.startOfDay(for: Date())).day ?? 0
+                return values[6 - offset]
+            },
+            streakDays: 2,
+            medianFirstReview: 4 * 3600 + 32 * 60, firstReviewSample: 20,
+            checksPassRate: 91, mostFailingCheck: "lint", mostFailingCount: 1
+        )
     }
 
     static var repoCI: [RepoCIStatus] {

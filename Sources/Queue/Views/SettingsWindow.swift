@@ -24,6 +24,8 @@ final class SettingsWindowController {
             window = makeWindow(state: state)
             window?.center()
         }
+        // The user may have just flipped notifications in System Settings.
+        Notifier.shared.refreshAuthorizationStatus()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }
@@ -113,6 +115,7 @@ struct SettingsContentView: View {
     @ObservedObject var settings: SettingsStore
     @Environment(\.colorScheme) private var scheme
     @State private var orgDraft: String = ""
+    @ObservedObject private var notifier = Notifier.shared
 
     init(state: AppState) {
         _settings = ObservedObject(wrappedValue: state.settings)
@@ -141,10 +144,23 @@ struct SettingsContentView: View {
                 hairline
                 refreshRow
             }
+            group("NOTIFICATIONS") {
+                if notifier.deniedInSystemSettings {
+                    notificationsDeniedRow
+                    hairline
+                }
+                toggleRow("New review request", isOn: $settings.notifyReviewRequests)
+                hairline
+                toggleRow("New mention", isOn: $settings.notifyMentions)
+                hairline
+                toggleRow("CI fails on your PR", isOn: $settings.notifyCIFailures)
+                hairline
+                toggleRow("Your PR is ready to merge", isOn: $settings.notifyPRReady)
+            }
             group("MENU BAR") {
                 badgeRow
                 hairline
-                toggleRow("Alert when CI fails on your PR", isOn: $settings.alertOnCIFail)
+                toggleRow("Red dot when CI fails on your PR", isOn: $settings.alertOnCIFail)
             }
         }
         .padding(EdgeInsets(top: 16, leading: 18, bottom: 16, trailing: 18))
@@ -306,6 +322,20 @@ struct SettingsContentView: View {
             rowLabel("Badge")
             Spacer(minLength: 8)
             BadgeSegmentedControl(selection: $settings.badgeStyle)
+        }
+        .padding(rowPadding)
+    }
+
+    // MARK: Notification rows
+
+    private var notificationsDeniedRow: some View {
+        HStack(spacing: 8) {
+            Text("Notifications are off for Queue in System Settings.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(ds.danger)
+            Spacer(minLength: 8)
+            Button("Open…") { notifier.openSystemSettings() }
+                .controlSize(.small)
         }
         .padding(rowPadding)
     }

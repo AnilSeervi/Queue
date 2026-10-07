@@ -73,7 +73,9 @@ Dev-build note: the bundle is ad-hoc signed, so macOS asks for Keychain access o
 - Snoozing hides an item until 9 AM the next day; the clock button in the tab bar snoozes everything until tomorrow; Undo wakes everything snoozed.
 - The footer shows **Up next** — the oldest item waiting on you, clickable to open on GitHub — plus time since last refresh (click to refresh) and the Settings gear.
 - Right-click (or ⌃-click) the status icon: Refresh Now · Settings… · Quit.
-- Settings: account/sign-out, launch at login, refresh interval (poll every 1–15 min), badge style (count/dot/off), red-dot alert when CI fails on your PR.
+- **Notifications** (macOS Notification Center) for new review requests, new mentions, CI failing on your PR, and your PR becoming ready to merge — one toggle each in Settings. Clicking one opens the item; three or more at once collapse into a summary; snooze-all keeps them quiet.
+- **Stats**: your week (reviews given, PRs opened/merged, daily activity, streak), review requests by age, your PRs still waiting on reviewers, median time to first review, and CI pass rate with the most-failing check.
+- Settings: account/sign-out, launch at login, refresh interval (poll every 1–15 min), notification toggles, badge style (count/dot/off), red dot when CI fails on your PR (shown next to the count in count mode).
 
 ## Layout
 

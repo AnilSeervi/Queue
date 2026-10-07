@@ -54,6 +54,11 @@ final class SettingsStore: ObservableObject {
     @Published var organization: String { didSet { defaults.set(organization, forKey: "organization") } }
     @Published var watchedRepos: Set<String> { didSet { defaults.set(Array(watchedRepos), forKey: "watchedRepos") } }
     @Published var onlyNeedsMe: Bool { didSet { defaults.set(onlyNeedsMe, forKey: "onlyNeedsMe") } }
+    // Notifications, one toggle per event type (all on by default).
+    @Published var notifyReviewRequests: Bool { didSet { defaults.set(notifyReviewRequests, forKey: "notifyReviewRequests") } }
+    @Published var notifyMentions: Bool { didSet { defaults.set(notifyMentions, forKey: "notifyMentions") } }
+    @Published var notifyCIFailures: Bool { didSet { defaults.set(notifyCIFailures, forKey: "notifyCIFailures") } }
+    @Published var notifyPRReady: Bool { didSet { defaults.set(notifyPRReady, forKey: "notifyPRReady") } }
     /// Display string for the global shortcut chip; capture UI updates this.
     @Published var shortcutDisplay: String { didSet { defaults.set(shortcutDisplay, forKey: "shortcutDisplay") } }
 
@@ -70,6 +75,10 @@ final class SettingsStore: ObservableObject {
         organization = defaults.string(forKey: "organization") ?? ""
         watchedRepos = Set(defaults.stringArray(forKey: "watchedRepos") ?? [])
         onlyNeedsMe = defaults.object(forKey: "onlyNeedsMe") as? Bool ?? false
+        notifyReviewRequests = defaults.object(forKey: "notifyReviewRequests") as? Bool ?? true
+        notifyMentions = defaults.object(forKey: "notifyMentions") as? Bool ?? true
+        notifyCIFailures = defaults.object(forKey: "notifyCIFailures") as? Bool ?? true
+        notifyPRReady = defaults.object(forKey: "notifyPRReady") as? Bool ?? true
         shortcutDisplay = defaults.string(forKey: "shortcutDisplay") ?? "⌥ ⇧ G"
 
         // Migrate away the demo-fixture defaults shipped before the org was
@@ -224,13 +233,18 @@ final class AppState: ObservableObject {
 
     var statusIconState: StatusIconState {
         if snoozeAllActive { return .snoozed }
-        if settings.alertOnCIFail, prs.contains(where: { $0.isFailing && !isSnoozed($0.id) }) {
-            return .ciFailing
-        }
+        let ciFailing = settings.alertOnCIFail
+            && prs.contains(where: { $0.isFailing && !isSnoozed($0.id) })
         let count = badgeCount
+        // Count mode keeps the number visible and adds the red dot beside it;
+        // only dot/off modes let the red dot stand alone.
+        if settings.badgeStyle == .count, count > 0 {
+            return .needsYouCount(count, ciFailing: ciFailing)
+        }
+        if ciFailing { return .ciFailing }
         if count == 0 { return .allClear }
         switch settings.badgeStyle {
-        case .count: return .needsYouCount(count)
+        case .count: return .needsYouCount(count, ciFailing: false)
         case .dot: return .needsYouDot
         case .off: return .allClear
         }
@@ -261,6 +275,13 @@ final class AppState: ObservableObject {
             repoCI = snapshot.repoCI
             lastRefreshedAt = Date()
             inlineError = nil
+            // Demo fixtures never change, so there's nothing to announce.
+            if !Self.isDemo {
+                Notifier.shared.process(
+                    inbox: visibleInbox, prs: visiblePRs,
+                    settings: settings, quiet: snoozeAllActive
+                )
+            }
         } catch {
             // A dead session (401 even after the refresh-token retry) drops
             // back to onboarding instead of erroring forever.

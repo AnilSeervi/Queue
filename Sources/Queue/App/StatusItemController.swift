@@ -99,7 +99,7 @@ final class StatusItemController: NSObject {
         var width: CGFloat = 19
 
         var countText: String?
-        if case .needsYouCount(let n) = iconState {
+        if case .needsYouCount(let n, _) = iconState {
             countText = "\(n)"
             let textWidth = (countText! as NSString).size(
                 withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]
@@ -111,7 +111,7 @@ final class StatusItemController: NSObject {
         // explicitly in the menu bar's resolved appearance.
         let needsColor: Bool
         switch iconState {
-        case .needsYouDot, .ciFailing: needsColor = true
+        case .needsYouDot, .ciFailing, .needsYouCount(_, ciFailing: true): needsColor = true
         default: needsColor = false
         }
 
@@ -128,7 +128,12 @@ final class StatusItemController: NSObject {
             drawPRGlyph(in: glyphRect, color: mono.withAlphaComponent(glyphAlpha))
 
             switch iconState {
-            case .needsYouCount:
+            case .needsYouCount(_, let ciFailing):
+                if ciFailing {
+                    let dot = NSBezierPath(ovalIn: NSRect(x: glyphRect.maxX - 3, y: height - 6.5, width: 6, height: 6))
+                    NSColor(red: 1, green: 0.37, blue: 0.32, alpha: 1).setFill() // #ff5f52
+                    dot.fill()
+                }
                 if let countText {
                     let attributes: [NSAttributedString.Key: Any] = [
                         .font: NSFont.systemFont(ofSize: 11, weight: .semibold),

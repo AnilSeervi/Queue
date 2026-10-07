@@ -51,6 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         state.openSettingsWindow = { [weak self] in self?.openSettings() }
         state.closePanel = { [weak self] in self?.closePanel() }
+        Notifier.shared.openPanel = { [weak self] in self?.showPanel() }
+        if !AppState.isDemo { Notifier.shared.requestPermissionIfNeeded() }
 
         statusController = StatusItemController(state: state) { [weak self] in
             self?.togglePanel()
@@ -83,7 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func showPanel() {
+    func showPanel() {
         let panel = FloatingPanel(rootView: PanelRootView().environmentObject(state))
         panel.onClose = { [weak self] in self?.panel = nil }
         self.panel = panel

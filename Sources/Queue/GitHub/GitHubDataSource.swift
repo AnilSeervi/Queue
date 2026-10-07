@@ -8,6 +8,22 @@ import Foundation
 // failing the whole refresh — except 401s, which always throw so the shell can
 // treat the session as signed out.
 
+/// Six-hour cache for the turnaround stat (expensive: one request per PR).
+private actor TurnaroundCache<Value: Sendable> {
+    private var value: Value?
+    private var storedAt: Date?
+
+    func fresh() -> Value? {
+        guard let storedAt, Date().timeIntervalSince(storedAt) < 6 * 3600 else { return nil }
+        return value
+    }
+
+    func store(_ new: Value) {
+        value = new
+        storedAt = Date()
+    }
+}
+
 /// Remembers the most recent Actions run id per PR id (for rerunChecks).
 /// A tiny actor so refresh's concurrent tasks and rerunChecks never race.
 private actor RunIDStore {
@@ -20,6 +36,7 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
     private let settings: SettingsStore
     private let client: GitHubClient
     private let runIDs = RunIDStore()
+    private let turnaroundCache = TurnaroundCache<Turnaround>()
 
     init(settings: SettingsStore, client: GitHubClient = GitHubClient()) {
         self.settings = settings
@@ -38,22 +55,36 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         async let mentionsFetch = guarded([]) { try await self.fetchMentions(config) }
         async let prsFetch = guarded(PRBundle()) { try await self.fetchMyPRs(config) }
         async let issuesFetch = guarded([]) { try await self.fetchAssignedIssues(config) }
-        async let reviewsThisWeekFetch = guarded(0) { try await self.fetchReviewsThisWeek(config) }
+        async let weekFetch = guarded(WeekStats()) { try await self.fetchWeek() }
+        async let mergedFetch = guarded(0) { try await self.fetchMergedThisWeek() }
+        async let turnaroundFetch = guarded(Turnaround()) { try await self.fetchTurnaround(config) }
 
         let reviews = try await reviewsFetch
         let mentions = try await mentionsFetch
         let bundle = try await prsFetch
         let issues = try await issuesFetch
-        let reviewsThisWeek = try await reviewsThisWeekFetch
+        let week = try await weekFetch
+        let merged = try await mergedFetch
+        let turnaround = try await turnaroundFetch
 
         await runIDs.replaceAll(bundle.runIDs)
 
         // Reviews first, then mentions; groupByRepo keeps per-repo order.
         let inbox = reviews.map(InboxEntry.review) + mentions.map(InboxEntry.mention)
-        let stats = Self.buildStats(
-            reviews: reviews, prs: bundle.prs,
-            checksPassed: bundle.checksPassed, checksTotal: bundle.checksTotal,
-            reviewsThisWeek: reviewsThisWeek
+        let mostFailing = bundle.failingChecks.max { $0.value < $1.value }
+        let stats = StatsData(
+            reviewsThisWeek: week.reviews,
+            prsOpenedThisWeek: week.prsOpened,
+            prsMergedThisWeek: merged,
+            activity: week.activity,
+            streakDays: week.streak,
+            medianFirstReview: turnaround.median,
+            firstReviewSample: turnaround.sample,
+            checksPassRate: bundle.checksTotal > 0
+                ? Int((Double(bundle.checksPassed) / Double(bundle.checksTotal) * 100).rounded())
+                : nil,
+            mostFailingCheck: mostFailing?.key,
+            mostFailingCount: mostFailing?.value ?? 0
         )
         return Snapshot(inbox: inbox, prs: bundle.prs, issues: issues, stats: stats, repoCI: [])
     }
@@ -215,11 +246,13 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         var runIDs: [String: Int] = [:]
         var checksPassed = 0
         var checksTotal = 0
+        /// Failing check name → number of your open PRs it's failing on.
+        var failingChecks: [String: Int] = [:]
     }
 
     private func fetchMyPRs(_ config: Config) async throws -> PRBundle {
         let items = try await searchWatched(base: "is:open is:pr author:@me", config: config)
-        struct PerPR { var pr: MyPR; var runID: Int?; var passed: Int; var total: Int }
+        struct PerPR { var pr: MyPR; var runID: Int?; var passed: Int; var total: Int; var failing: Set<String> }
 
         let perPR = await mapLimited(items, limit: 10) { item -> PerPR? in
             guard let repo = Self.repoFromAPIURL(item.repositoryUrl) else { return nil }
@@ -232,6 +265,7 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
             var ci = CIState.passing
             var runID: Int?
             var passed = 0, total = 0
+            var failingNames: Set<String> = []
             if let sha = detail?.head.sha {
                 let checks: CheckRunsResponse? = try? await self.client.get(
                     "repos/\(repo.fullName)/commits/\(sha)/check-runs",
@@ -240,6 +274,7 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
                 if let runs = checks?.checkRuns {
                     ci = Self.ciState(from: runs)
                     (passed, total) = Self.checkTally(runs)
+                    failingNames = Set(runs.filter { Self.failureConclusions.contains($0.conclusion ?? "") }.map(\.name))
                     runID = await self.actionsRunID(repo: repo, sha: sha, runs: runs)
                 }
             }
@@ -268,9 +303,12 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
                 approvals: approvals,
                 requiredApprovals: required,
                 age: Age(date: item.createdAt),
-                url: URL(string: item.htmlUrl) ?? repo.url
+                url: URL(string: item.htmlUrl) ?? repo.url,
+                requestedReviewers: (detail?.requestedReviewers ?? []).map(\.login)
+                    + (detail?.requestedTeams ?? []).map(\.name),
+                isDraft: detail?.draft ?? item.draft ?? false
             )
-            return PerPR(pr: pr, runID: runID, passed: passed, total: total)
+            return PerPR(pr: pr, runID: runID, passed: passed, total: total, failing: failingNames)
         }
 
         var bundle = PRBundle()
@@ -279,6 +317,7 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
             if let runID = entry.runID { bundle.runIDs[entry.pr.id] = runID }
             bundle.checksPassed += entry.passed
             bundle.checksTotal += entry.total
+            for name in entry.failing { bundle.failingChecks[name, default: 0] += 1 }
         }
         return bundle
     }
@@ -401,59 +440,122 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
 
     // MARK: - Stats
 
-    /// Approximation: search can't filter on review-submission time —
-    /// `reviewed-by:` matches PRs the user EVER reviewed and `updated:` is the
-    /// PR's timestamp. Bounded by a precise 7-day timestamp instead of a
-    /// date-only (up to 8-day) window.
-    private func fetchReviewsThisWeek(_ config: Config) async throws -> Int {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        let since = formatter.string(from: Date().addingTimeInterval(-7 * 86400))
-        let base = "is:pr reviewed-by:@me updated:>=\(since)"
+    private struct WeekStats {
+        var reviews = 0
+        var prsOpened = 0
+        var activity = lastSevenDays { _ in 0 }
+        var streak = 0
+    }
+
+    /// One GraphQL query: the last 7 days' review/PR contribution totals, plus
+    /// the year's contribution calendar for the activity bars and streak.
+    private func fetchWeek() async throws -> WeekStats {
+        let iso = ISO8601DateFormatter()
+        let now = Date()
+        let query = """
+        query($from: DateTime!, $to: DateTime!) {
+          viewer {
+            week: contributionsCollection(from: $from, to: $to) {
+              totalPullRequestReviewContributions
+              totalPullRequestContributions
+            }
+            year: contributionsCollection {
+              contributionCalendar {
+                weeks { contributionDays { date contributionCount } }
+              }
+            }
+          }
+        }
+        """
+        let data = try await client.graphql(query: query, variables: [
+            "from": iso.string(from: now.addingTimeInterval(-7 * 86400)),
+            "to": iso.string(from: now),
+        ])
+        let viewer = data["viewer"] as? [String: Any] ?? [:]
+        let week = viewer["week"] as? [String: Any] ?? [:]
+        let year = viewer["year"] as? [String: Any] ?? [:]
+        let calendar = year["contributionCalendar"] as? [String: Any] ?? [:]
+        let weeks = calendar["weeks"] as? [[String: Any]] ?? []
+
+        var byDate: [String: Int] = [:]   // "2026-10-07" → count
+        for week in weeks {
+            for day in week["contributionDays"] as? [[String: Any]] ?? [] {
+                if let date = day["date"] as? String {
+                    byDate[date] = day["contributionCount"] as? Int ?? 0
+                }
+            }
+        }
+        let dayKey = DateFormatter()
+        dayKey.calendar = Calendar(identifier: .gregorian)
+        dayKey.dateFormat = "yyyy-MM-dd"
+        func count(_ day: Date) -> Int { byDate[dayKey.string(from: day)] ?? 0 }
+
+        // Streak: consecutive active days ending today — or yesterday, so the
+        // streak doesn't read 0 every morning before the first contribution.
+        let cal = Calendar.current
+        var day = cal.startOfDay(for: now)
+        if count(day) == 0 { day = cal.date(byAdding: .day, value: -1, to: day)! }
+        var streak = 0
+        while count(day) > 0, streak < 366 {
+            streak += 1
+            day = cal.date(byAdding: .day, value: -1, to: day)!
+        }
+
+        return WeekStats(
+            reviews: week["totalPullRequestReviewContributions"] as? Int ?? 0,
+            prsOpened: week["totalPullRequestContributions"] as? Int ?? 0,
+            activity: lastSevenDays(counts: count),
+            streak: streak
+        )
+    }
+
+    private func fetchMergedThisWeek() async throws -> Int {
+        let since = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-7 * 86400))
         let results: SearchResults = try await client.get("search/issues", query: [
-            URLQueryItem(name: "q", value: base),
+            URLQueryItem(name: "q", value: "is:pr author:@me is:merged merged:>=\(since)"),
             URLQueryItem(name: "per_page", value: "1"),
         ])
         return results.totalCount
     }
 
-    private static func buildStats(
-        reviews: [ReviewRequest],
-        prs: [MyPR],
-        checksPassed: Int,
-        checksTotal: Int,
-        reviewsThisWeek: Int
-    ) -> StatsData {
-        let oldest = reviews.min { $0.age.date < $1.age.date }
-        return StatsData(
-            waitingOnYou: reviews.count,
-            waitingOnOthers: prs.filter { $0.approvals < $0.requiredApprovals }.count,
-            // Not cheaply derivable from these endpoints; shown as an em dash.
-            reviewTurnaround: "—",
-            // No conclusive check runs → treat as all-passing (100).
-            checksPassRate: checksTotal > 0 ? Int((Double(checksPassed) / Double(checksTotal) * 100).rounded()) : 100,
-            oldestWaiting: oldest?.age.display ?? "—",
-            oldestWaitingContext: oldest.map { "\($0.title) #\($0.number)" } ?? "",
-            reviewsThisWeek: reviewsThisWeek,
-            activity: emptyActivity()
-        )
+    private struct Turnaround {
+        var median: TimeInterval?
+        var sample = 0
     }
 
-    /// Per-day review/merge counts aren't cheaply derivable — 7 zero bars with
-    /// correct Monday-first labels, today and the weekend flagged.
-    private static func emptyActivity() -> [DayActivity] {
-        let labels = ["M", "T", "W", "T", "F", "S", "S"]
-        let weekday = Calendar.current.component(.weekday, from: Date()) // 1 = Sunday
-        let todayIndex = (weekday + 5) % 7                               // Monday-first 0…6
-        return labels.enumerated().map { index, label in
-            DayActivity(
-                id: index,
-                label: label,
-                value: 0,
-                isToday: index == todayIndex,
-                isWeekend: index >= 5
+    /// Median time from opening to the first review by someone else, over
+    /// your 20 most recently merged PRs. ~21 requests, so it's computed at
+    /// most every 6 hours and served from cache in between.
+    private func fetchTurnaround(_ config: Config) async throws -> Turnaround {
+        if let cached = await turnaroundCache.fresh() { return cached }
+        let results: SearchResults = try await client.get("search/issues", query: [
+            URLQueryItem(name: "q", value: "is:pr author:@me is:merged sort:updated-desc"),
+            URLQueryItem(name: "per_page", value: "20"),
+        ])
+        let me = config.login.lowercased()
+        let waits = await mapLimited(results.items, limit: 5) { item -> TimeInterval? in
+            guard let repo = Self.repoFromAPIURL(item.repositoryUrl) else { return nil }
+            let reviews: [ReviewPayload]? = try? await self.client.get(
+                "repos/\(repo.fullName)/pulls/\(item.number)/reviews",
+                query: [URLQueryItem(name: "per_page", value: "100")]
             )
+            let first = reviews?
+                .filter { $0.state != "PENDING" && ($0.user?.login.lowercased() ?? me) != me }
+                .compactMap(\.submittedAt)
+                .min()
+            guard let first else { return nil }
+            let wait = first.timeIntervalSince(item.createdAt)
+            return wait > 0 ? wait : nil
         }
+        let sorted = waits.sorted()
+        var result = Turnaround(sample: sorted.count)
+        // Fewer than 3 reviewed PRs isn't a meaningful median.
+        if sorted.count >= 3 {
+            let mid = sorted.count / 2
+            result.median = sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+        }
+        await turnaroundCache.store(result)
+        return result
     }
 
     // MARK: - Guards & helpers
@@ -542,13 +644,19 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         var updatedAt: Date?
         var user: User?
         var labels: [Label]?
+        var draft: Bool?
     }
 
     private struct PullDetail: Decodable {
         struct Head: Decodable { var ref: String; var sha: String }
+        struct User: Decodable { var login: String }
+        struct Team: Decodable { var name: String }
         var additions: Int?
         var deletions: Int?
         var head: Head
+        var draft: Bool?
+        var requestedReviewers: [User]?
+        var requestedTeams: [Team]?
     }
 
     private struct CheckRunsResponse: Decodable {
@@ -567,6 +675,7 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         struct User: Decodable { var login: String }
         var user: User?
         var state: String
+        var submittedAt: Date?
     }
 
     private struct NotificationThread: Decodable {

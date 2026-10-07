@@ -82,7 +82,8 @@ enum Snapshotter {
     private static func snapIconStates(to dir: URL) {
         let states: [(String, StatusIconState)] = [
             ("all-clear", .allClear),
-            ("count", .needsYouCount(4)),
+            ("count", .needsYouCount(4, ciFailing: false)),
+            ("count-ci", .needsYouCount(4, ciFailing: true)),
             ("dot", .needsYouDot),
             ("ci-failing", .ciFailing),
             ("snoozed", .snoozed),
