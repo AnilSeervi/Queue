@@ -25,6 +25,44 @@ struct RepoGroupHeader: View {
     }
 }
 
+// MARK: - Stacks
+
+/// "Stack · 3 PRs → main" above a stack's PRs within a repo group.
+struct StackHeader: View {
+    var stack: StackInfo
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let ds = DS(scheme)
+        HStack(spacing: 5) {
+            Image(systemName: "square.stack.3d.up")
+                .font(.system(size: 9.5, weight: .medium))
+            Text("Stack · \(stack.size) PR\(stack.size == 1 ? "" : "s")\(stack.baseBranch.isEmpty ? "" : " → \(stack.baseBranch)")")
+                .font(.system(size: 10.5, weight: .medium))
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(ds.textGroupCount)
+        .padding(EdgeInsets(top: 5, leading: 14, bottom: 1, trailing: 14))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Stack of \(stack.size) pull requests onto \(stack.baseBranch)")
+    }
+}
+
+/// A stacked PR's place, "2/3" (1 is closest to the base branch).
+struct StackPositionChip: View {
+    var stack: StackInfo
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let ds = DS(scheme)
+        Text("\(stack.position)/\(stack.size)")
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(ds.textFaint)
+            .help("Layer \(stack.position) of \(stack.size) in the stack (1 sits on \(stack.baseBranch.isEmpty ? "the base branch" : stack.baseBranch))")
+            .accessibilityLabel("Layer \(stack.position) of \(stack.size)")
+    }
+}
+
 // MARK: - Row
 
 /// List row: leading 15px icon slot, title + meta, trailing slot (age/pill),

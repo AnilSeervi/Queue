@@ -748,31 +748,59 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// What Merge on `pr` merges, bottom first: the PR alone, or for a
+    /// stacked PR it and every open PR below it ("merge up to here"). nil
+    /// when Merge isn't offered — for a stack, unless every one of those
+    /// layers is yours, listed, and ready.
+    func stackMerge(for pr: MyPR) -> [MyPR]? {
+        guard let stack = pr.stack else { return pr.canMerge ? [pr] : nil }
+        guard pr.canWrite, pr.headSHA != nil, pr.mergeMethod != nil else { return nil }
+        var layers: [MyPR] = []
+        for member in stack.openMembersUpToHere {
+            guard let layer = prs.first(where: { $0.repo == pr.repo && $0.number == member.number }),
+                  layer.isReadyAsStackLayer
+            else { return nil }
+            layers.append(layer)
+        }
+        guard layers.last?.id == pr.id else { return nil }
+        // GitHub checks the stack against the bottom PR's base branch.
+        guard let bottom = layers.first, bottom.mergeState == .clean || bottom.mergeState == .hasHooks else { return nil }
+        return layers
+    }
+
     func merge(_ pr: MyPR) {
-        guard let index = prs.firstIndex(of: pr) else { return }
+        guard prs.contains(pr), let layers = stackMerge(for: pr) else { return }
         clearActionError()
         let generation = sessionGeneration
-        prs.remove(at: index)
-        mergedIds.insert(pr.id)
-        mergedTitles.append(pr.title)
-        // In Done at once, until GitHub's search lists the merge.
-        let done = DoneItem(id: DoneItem.prID(pr.repo, pr.number), repo: pr.repo, number: pr.number,
-                            title: pr.title, url: pr.url, doneAt: Date(), outcome: .merged)
-        let replaced = logDone(done)
+        let originalPRs = prs
+        let ids = Set(layers.map(\.id))
+        prs.removeAll { ids.contains($0.id) }
+        mergedIds.formUnion(ids)
+        let title = layers.count > 1 ? "\(pr.title) + \(layers.count - 1) below" : pr.title
+        mergedTitles.append(title)
+        // In Done at once, until GitHub's search lists the merges.
+        let logged = layers.map { layer -> (DoneItem, DoneItem?) in
+            let done = DoneItem(id: DoneItem.prID(layer.repo, layer.number), repo: layer.repo, number: layer.number,
+                                title: layer.title, url: layer.url, doneAt: Date(), outcome: .merged)
+            return (done, logDone(done))
+        }
         onStateChange?()
         Task {
             do { try await dataSource.merge(pr) }
             catch {
                 guard generation == sessionGeneration else { return }
-                mergedIds.remove(pr.id)
-                unlogDone(done, restoring: replaced)
+                mergedIds.subtract(ids)
+                for (done, replaced) in logged.reversed() { unlogDone(done, restoring: replaced) }
                 // Roll back only this merge's entry (titles can repeat across repos).
-                if let last = mergedTitles.lastIndex(of: pr.title) {
+                if let last = mergedTitles.lastIndex(of: title) {
                     mergedTitles.remove(at: last)
                 }
-                // A concurrent refresh may have re-added the row already.
-                if !prs.contains(where: { $0.id == pr.id }) {
-                    prs.insert(pr, at: min(index, prs.count))
+                // Put the layers back where they were; a concurrent refresh
+                // may have re-added some already.
+                for (offset, layer) in originalPRs.enumerated() where ids.contains(layer.id) {
+                    if !prs.contains(where: { $0.id == layer.id }) {
+                        prs.insert(layer, at: min(offset, prs.count))
+                    }
                 }
                 reportActionError("Merge failed — \(error.localizedDescription)")
             }

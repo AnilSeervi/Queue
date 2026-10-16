@@ -34,8 +34,14 @@ struct MyPRsView: View {
                         .map { RepoGroup(repo: $0.repo, items: $0.items) }
                     ForEach(groups) { group in
                         RepoGroupHeader(repo: group.repo, count: group.items.count)
-                        ForEach(group.items) { pr in
-                            MyPRRowView(pr: pr)
+                        ForEach(stackSegments(group.items, stack: \.stack)) { segment in
+                            switch segment {
+                            case .single(let pr):
+                                MyPRRowView(pr: pr)
+                            case .stack(let stack, let layers):
+                                StackHeader(stack: stack)
+                                ForEach(layers) { pr in MyPRRowView(pr: pr) }
+                            }
                         }
                     }
                     mergedLine
@@ -81,7 +87,12 @@ private struct MyPRRowView: View {
             pinned: pinned,
             onOpen: { state.open(pr.url) },
             leading: { statusIcon(ds) },
-            trailing: { StatusPillView(text: pr.pillText, kind: pr.pillKind) },
+            trailing: {
+                HStack(spacing: 6) {
+                    if let stack = pr.stack { StackPositionChip(stack: stack) }
+                    StatusPillView(text: pr.pillText, kind: pr.pillKind)
+                }
+            },
             actions: { actionCluster(ds) }
         )
         // A pinned row keeps its cluster when the pointer leaves; a pending
@@ -136,16 +147,21 @@ private struct MyPRRowView: View {
     }
 
     @ViewBuilder private func actionCluster(_ ds: DS) -> some View {
-        if pr.canMerge, let method = pr.mergeMethod {
+        if let layers = state.stackMerge(for: pr), let method = pr.mergeMethod {
             let confirming = confirmingMerge || preview.confirmingMerge.contains(pr.id)
+            let what = layers.count > 1
+                ? "#\(pr.number) and the \(layers.count - 1) PR\(layers.count == 2 ? "" : "s") below it"
+                : "#\(pr.number)"
             IconActionButton(
                 systemName: "arrow.triangle.merge",
                 help: confirming
-                    ? "Click again to merge #\(pr.number) (\(Self.describe(method).lowercased()))"
-                    : "\(Self.describe(method)) — click, then confirm",
+                    ? "Click again to merge \(what) (\(Self.describe(method).lowercased()))"
+                    : layers.count > 1
+                        ? "\(Self.describe(method)) \(what) — click, then confirm"
+                        : "\(Self.describe(method)) — click, then confirm",
                 accessibilityName: confirming ? "Confirm: \(Self.describe(method).lowercased())" : "Merge",
                 tint: ds.merge,
-                label: confirming ? method.confirmLabel : nil,
+                label: confirming ? method.confirmLabel(count: layers.count) : nil,
                 action: { mergeTapped() }
             )
             // The cluster goes away when the pointer leaves the row; so does

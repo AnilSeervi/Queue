@@ -54,8 +54,39 @@ struct BranchRef: Hashable, Codable {
     var prNodeID: String?
     /// Your own PR: check it out as a tracking branch you can push.
     var isMine: Bool
+    /// Its stack, when it's in one: every PR of a stack opens in one shared
+    /// worktree.
+    var stack: StackInfo? = nil
 
     var isFromFork: Bool { headRepo != nil && headRepo != repo }
+}
+
+/// A PR's place in a GitHub stack (stacked pull requests: an ordered chain
+/// of same-repo PRs, each building on the one below; they merge bottom-up).
+struct StackInfo: Hashable, Codable {
+    /// One PR of the stack, as of this refresh.
+    struct Member: Hashable, Codable {
+        var nodeID: String
+        var number: Int
+        var branch: String
+        var isOpen: Bool
+    }
+    /// GitHub node id of the stack.
+    var id: String
+    /// Numbers stacks within their repo ("stack #3").
+    var number: Int
+    var size: Int
+    /// This PR's position: 1 is closest to the base branch.
+    var position: Int
+    /// The branch the stack lands on (e.g. main).
+    var baseBranch: String
+    /// Every PR of the stack, bottom first.
+    var members: [Member]
+
+    /// Open PRs at or below this one: what "merge up to here" merges.
+    var openMembersUpToHere: [Member] {
+        members.enumerated().filter { $0.offset < position && $0.element.isOpen }.map(\.element)
+    }
 }
 
 /// Open/closed state of a PR, for worktree cleanup.
@@ -100,6 +131,8 @@ struct ReviewRequest: Identifiable, Hashable {
     var updatedAt: Date? = nil
     /// The PR's head branch (Copy branch / open in editor); nil if unknown.
     var branchRef: BranchRef? = nil
+    /// Its stack, when it's in one.
+    var stack: StackInfo? = nil
 
     var meta: String { "#\(number) · \(author.login) · +\(additions) −\(deletions)" }
 }
@@ -229,11 +262,15 @@ enum MergeMethod: String, Hashable, Codable {
     case merge, squash, rebase
 
     /// Confirm-button label for the two-step inline Merge.
-    var confirmLabel: String {
+    var confirmLabel: String { confirmLabel(count: 1) }
+
+    /// Merging a stacked PR merges it and every open PR below it.
+    func confirmLabel(count: Int) -> String {
+        let prs = count > 1 ? " \(count) PRs" : ""
         switch self {
-        case .merge: return "Merge?"
-        case .squash: return "Squash & merge?"
-        case .rebase: return "Rebase & merge?"
+        case .merge: return "Merge\(prs)?"
+        case .squash: return "Squash & merge\(prs)?"
+        case .rebase: return "Rebase & merge\(prs)?"
         }
     }
 }
@@ -277,11 +314,26 @@ struct MyPR: Identifiable, Hashable {
     /// Head branch details for open-in-editor (fork PRs to repos you
     /// contribute to included); nil if unknown.
     var branchRef: BranchRef? = nil
+    /// Its stack, when it's in one.
+    var stack: StackInfo? = nil
 
     var meta: String { "#\(number) · \(branch)" }
 
     /// Merge offered (two-step) — ready, writable, pinned, method known.
+    /// For a stacked PR, AppState.stackMerge(for:) also checks the PRs below.
     var canMerge: Bool { isReady && canWrite && headSHA != nil && mergeMethod != nil }
+
+    /// Ready as one layer of a stack: reviewed, green, no conflicts. GitHub
+    /// judges a stack's merge against the bottom PR's base, so an upper
+    /// layer's own merge state (often BLOCKED, as it targets the branch
+    /// below) only rules it out on conflicts.
+    var isReadyAsStackLayer: Bool {
+        guard !isDraft, !changesRequested, headSHA != nil, approvals >= 1, canWrite, !hasConflicts else { return false }
+        switch ci {
+        case .passing, .none: return true
+        default: return false
+        }
+    }
 
     /// Re-run offered — failing Actions runs in a repo you can write to.
     var canRerun: Bool { isFailing && canWrite && !failedRunIDs.isEmpty }
@@ -559,4 +611,46 @@ func groupByRepo<T>(_ items: [T], repo: (T) -> RepoRef) -> [(repo: RepoRef, item
         buckets[repo(item), default: []].append(item)
     }
     return buckets.keys.sorted().map { ($0, buckets[$0]!) }
+}
+
+// MARK: - Stack grouping
+
+/// A stretch of a repo group: a PR on its own, or a stack's PRs together,
+/// top layer first (the order GitHub's stack map reads).
+enum StackSegment<Item: Identifiable>: Identifiable {
+    case single(Item)
+    case stack(StackInfo, [Item])
+
+    var id: String {
+        switch self {
+        case .single(let item): return "item-\(item.id)"
+        case .stack(let info, _): return "stack-\(info.id)"
+        }
+    }
+}
+
+/// Splits `items` into singles and stacks. A stack sits where its first
+/// item came in the list, so the list's own order still decides placement.
+func stackSegments<Item: Identifiable>(_ items: [Item], stack: (Item) -> StackInfo?) -> [StackSegment<Item>] {
+    var segments: [StackSegment<Item>] = []
+    var stackIndex: [String: Int] = [:]
+    var members: [String: [(position: Int, item: Item)]] = [:]
+    var infos: [String: StackInfo] = [:]
+    for item in items {
+        guard let info = stack(item) else {
+            segments.append(.single(item))
+            continue
+        }
+        if stackIndex[info.id] == nil {
+            stackIndex[info.id] = segments.count
+            segments.append(.stack(info, []))
+            infos[info.id] = info
+        }
+        members[info.id, default: []].append((info.position, item))
+    }
+    for (id, index) in stackIndex {
+        let layers = (members[id] ?? []).sorted { $0.position > $1.position }.map(\.item)
+        segments[index] = .stack(infos[id]!, layers)
+    }
+    return segments
 }

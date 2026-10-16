@@ -133,6 +133,7 @@ enum QueueGraphQL {
                 author { login }
                 repo: repository { fullName: nameWithOwner }
                 \(headBranch)
+                \(stack)
               }
             """
         case .myPRs:
@@ -145,6 +146,7 @@ enum QueueGraphQL {
             ... on PullRequest {
                 id number title url createdAt updatedAt isDraft reviewDecision
                 \(headBranch)
+                \(stack)
                 headSHA: headRefOid
                 mergeState: mergeStateStatus
                 repo: repository {
@@ -224,6 +226,16 @@ enum QueueGraphQL {
     branch: headRefName
         isCrossRepository
         headRepo: headRepository { fullName: nameWithOwner }
+    """
+
+    /// The PR's stack (stacked pull requests), when it's in one: null for
+    /// most PRs, and on repos without stacks.
+    private static let stack = """
+    stack {
+          id number size baseRefName
+          entries(first: 25) { nodes { position pullRequest { id number headRefName state } } }
+        }
+        stackEntry { position }
     """
 
     /// Your latest submitted reviews on a PR, and its latest dismissals (a
@@ -424,6 +436,29 @@ struct RepoPayload: Decodable {
     var permission: String?
 }
 
+/// A PR's stack and its place in it.
+struct StackPayload: Decodable {
+    struct Entry: Decodable {
+        struct Member: Decodable {
+            var id: String?
+            var number: Int?
+            var headRefName: String?
+            var state: String?      // OPEN | CLOSED | MERGED
+        }
+        var position: Int?
+        var pullRequest: Member?
+    }
+    var id: String?
+    var number: Int?
+    var size: Int?
+    var baseRefName: String?
+    var entries: NodeList<Entry>?
+}
+
+struct StackEntryPayload: Decodable {
+    var position: Int?
+}
+
 struct ReviewRequestPayload: Decodable {
     var id: String?
     var number: Int?
@@ -439,6 +474,8 @@ struct ReviewRequestPayload: Decodable {
     var branch: String?
     var isCrossRepository: Bool?
     var headRepo: RepoPayload?
+    var stack: StackPayload?
+    var stackEntry: StackEntryPayload?
 }
 
 struct MyPRPayload: Decodable {
@@ -494,6 +531,8 @@ struct MyPRPayload: Decodable {
     var repo: RepoPayload?
     var verdicts: NodeList<Verdict>?
     var pendingReviewers: NodeList<PendingReviewer>?
+    var stack: StackPayload?
+    var stackEntry: StackEntryPayload?
     /// nil when the head commit has no checks or statuses — or when GitHub
     /// nulled it with an error, which the data source tells apart.
     var checks: Checks?

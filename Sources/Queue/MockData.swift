@@ -26,6 +26,23 @@ enum MockData {
     /// session's worktrees never match a fixture.
     static func nodeID(_ n: Int) -> String { String(format: "PR_kwDOdemo%04d", n) }
 
+    /// A demo stack: `layers` are (PR number, branch), bottom first; `at` is
+    /// the position of the PR this copy is for.
+    private static func stack(_ id: String, number: Int, _ layers: [(Int, String)], at position: Int) -> StackInfo {
+        StackInfo(
+            id: id, number: number, size: layers.count, position: position, baseBranch: "main",
+            members: layers.map { StackInfo.Member(nodeID: nodeID($0.0), number: $0.0, branch: $0.1, isOpen: true) }
+        )
+    }
+    private static let slaStack = [(4820, "mvdheijden/sla-timer-service"), (4821, "feat/sla-breach-webhooks")]
+    private static let shortcutStack = [(2230, "kb/registry"), (2231, "kb/focus-model"), (2232, "kb/triage-shortcuts")]
+
+    private static func withStack(_ ref: BranchRef, _ stack: StackInfo) -> BranchRef {
+        var ref = ref
+        ref.stack = stack
+        return ref
+    }
+
     /// A teammate's branch; `fork` when it lives in their fork.
     private static func theirBranch(_ repo: RepoRef, _ n: Int, _ name: String, fork: RepoRef? = nil) -> BranchRef {
         BranchRef(repo: repo, number: n, branch: name, headRepo: fork, prNodeID: nodeID(n), isMine: false)
@@ -39,7 +56,18 @@ enum MockData {
                 author: UserRef(login: "mvdheijden"), additions: 342, deletions: 18,
                 age: Age(date: ago(hours: 2)), url: prURL(itsmCore, 4821),
                 headSHA: "3f9c2e1a7b", nodeID: nodeID(4821), updatedAt: ago(minutes: 50),
-                branchRef: theirBranch(itsmCore, 4821, "feat/sla-breach-webhooks"))),
+                branchRef: withStack(theirBranch(itsmCore, 4821, "feat/sla-breach-webhooks"),
+                                     stack("STK_demo_sla", number: 2, slaStack, at: 2)),
+                stack: stack("STK_demo_sla", number: 2, slaStack, at: 2))),
+            .review(ReviewRequest(
+                id: "rr-4820", repo: itsmCore, number: 4820,
+                title: "Extract SLA timer service",
+                author: UserRef(login: "mvdheijden"), additions: 188, deletions: 64,
+                age: Age(date: ago(hours: 3)), url: prURL(itsmCore, 4820),
+                headSHA: "9a1e4c7d20", nodeID: nodeID(4820), updatedAt: ago(hours: 1),
+                branchRef: withStack(theirBranch(itsmCore, 4820, "mvdheijden/sla-timer-service"),
+                                     stack("STK_demo_sla", number: 2, slaStack, at: 1)),
+                stack: stack("STK_demo_sla", number: 2, slaStack, at: 1))),
             .review(ReviewRequest(
                 id: "rr-4809", repo: itsmCore, number: 4809,
                 title: "Refactor incident assignment rules",
@@ -113,6 +141,27 @@ enum MockData {
                  age: Age(date: ago(days: 2)), url: prURL(webClient, 2219),
                  mergeState: .dirty, reviewDecision: .approved,
                  headSHA: "0b7d3e2f61", mergeMethod: .squash, updatedAt: ago(hours: 5)),
+            MyPR(id: "pr-2232", repo: webClient, number: 2232,
+                 title: "Wire triage shortcuts to the panel", branch: "kb/triage-shortcuts",
+                 ci: .passing, approvals: 0,
+                 age: Age(date: ago(hours: 4)), url: prURL(webClient, 2232),
+                 mergeState: .blocked, reviewDecision: .reviewRequired,
+                 headSHA: "e3d2c1b0a9", mergeMethod: .squash, updatedAt: ago(hours: 2),
+                 stack: stack("STK_demo_kb", number: 7, shortcutStack, at: 3)),
+            MyPR(id: "pr-2231", repo: webClient, number: 2231,
+                 title: "Add keyboard focus model", branch: "kb/focus-model",
+                 ci: .passing, approvals: 1,
+                 age: Age(date: ago(hours: 9)), url: prURL(webClient, 2231),
+                 mergeState: .blocked, reviewDecision: .approved,
+                 headSHA: "a9b8c7d6e5", mergeMethod: .squash, updatedAt: ago(hours: 3),
+                 stack: stack("STK_demo_kb", number: 7, shortcutStack, at: 2)),
+            MyPR(id: "pr-2230", repo: webClient, number: 2230,
+                 title: "Extract key-binding registry", branch: "kb/registry",
+                 ci: .passing, approvals: 1,
+                 age: Age(date: ago(days: 1)), url: prURL(webClient, 2230),
+                 mergeState: .clean, reviewDecision: .approved,
+                 headSHA: "5f4e3d2c1b", mergeMethod: .squash, updatedAt: ago(hours: 6),
+                 stack: stack("STK_demo_kb", number: 7, shortcutStack, at: 1)),
             MyPR(id: "pr-2215", repo: webClient, number: 2215,
                  title: "Dark mode for request detail pane", branch: "feat/detail-dark-mode",
                  ci: .passing, approvals: 2,
@@ -138,7 +187,7 @@ enum MockData {
         ].map { pr in
             var pr = pr
             pr.branchRef = BranchRef(repo: pr.repo, number: pr.number, branch: pr.branch,
-                                     prNodeID: nodeID(pr.number), isMine: true)
+                                     prNodeID: nodeID(pr.number), isMine: true, stack: pr.stack)
             return pr
         }
     }

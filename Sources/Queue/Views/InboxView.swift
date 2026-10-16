@@ -32,8 +32,14 @@ struct InboxView: View {
                 ListScrollView(tab: .inbox) {
                     ForEach(groupByRepo(entries, repo: { $0.repo }), id: \.repo) { group in
                         RepoGroupHeader(repo: group.repo, count: group.items.count)
-                        ForEach(group.items) { entry in
-                            row(for: entry, ds: ds)
+                        ForEach(stackSegments(group.items, stack: Self.stack)) { segment in
+                            switch segment {
+                            case .single(let entry):
+                                row(for: entry, ds: ds)
+                            case .stack(let stack, let layers):
+                                StackHeader(stack: stack)
+                                ForEach(layers) { entry in row(for: entry, ds: ds) }
+                            }
                         }
                     }
                     approvedLine
@@ -43,6 +49,12 @@ struct InboxView: View {
             }
             TabStatusLines()
         }
+    }
+
+    /// Review requests can be stacked; mentions never are.
+    private static func stack(_ entry: InboxEntry) -> StackInfo? {
+        if case .review(let request) = entry { return request.stack }
+        return nil
     }
 
     @ViewBuilder private var approvedLine: some View {
@@ -66,7 +78,10 @@ struct InboxView: View {
                     PRGlyph(color: request.age.isStale ? ds.attention : ds.success)
                 },
                 trailing: {
-                    AgeText(age: request.age)
+                    HStack(spacing: 6) {
+                        if let stack = request.stack { StackPositionChip(stack: stack) }
+                        AgeText(age: request.age)
+                    }
                 },
                 actions: {
                     // Approve green — spec: dark #7ee2a0, light ds.success.

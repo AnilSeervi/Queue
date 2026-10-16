@@ -159,6 +159,11 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         }
         var body: [String: Any] = ["sha": sha]
         if let method = pr.mergeMethod { body["merge_method"] = method.rawValue }
+        // GitHub merges stacks only through its asynchronous merge API.
+        if pr.stack != nil {
+            try await mergeAsync(pr, body: body)
+            return
+        }
         do {
             try await client.rest(
                 method: "PUT",
@@ -167,6 +172,48 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
             )
         } catch GitHubError.http(status: 409, message: _) {
             throw GitHubError.api("New commits since refresh — refresh and retry")
+        }
+    }
+
+    /// One step of GitHub's asynchronous merge (stacks): what
+    /// PUT …/merge-async returns and what polling …/merge-async/{uuid} does.
+    private struct AsyncMerge: Decodable {
+        struct Details: Decodable { var uuid: String?; var message: String? }
+        var status: String?          // pending | merged | enqueued | failed
+        var uuid: String?
+        var details: Details?
+        var id: String? { uuid ?? details?.uuid }
+    }
+
+    /// Merges a stacked PR, and with it every open PR below it, then waits
+    /// up to ~90s for GitHub to finish. Merged or queued is success.
+    private func mergeAsync(_ pr: MyPR, body: [String: Any]) async throws {
+        let path = "repos/\(pr.repo.fullName)/pulls/\(pr.number)/merge-async"
+        var request = body
+        request["merge_action"] = "default"
+        var result: AsyncMerge
+        do {
+            result = try await client.get(path, method: "PUT", body: request)
+        } catch GitHubError.http(status: 409, message: _) {
+            throw GitHubError.api("A merge of this stack is already running on GitHub — refresh in a moment")
+        }
+        let deadline = Date().addingTimeInterval(90)
+        while true {
+            switch result.status {
+            case "merged", "enqueued":
+                return
+            case "failed":
+                throw GitHubError.api(result.details?.message ?? "GitHub couldn't merge the stack")
+            default:
+                guard let id = result.id else {
+                    throw GitHubError.api("GitHub accepted the merge but sent nothing to follow — refresh to see the result")
+                }
+                guard Date() < deadline else {
+                    throw GitHubError.api("GitHub is still merging the stack — refresh in a moment")
+                }
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                result = try await client.get("\(path)/\(id)")
+            }
         }
     }
 
@@ -483,8 +530,10 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
                 updatedAt: node.updatedAt,
                 branchRef: branchRef(
                     repo: repo, number: number, branch: node.branch, crossRepo: node.isCrossRepository,
-                    headRepo: node.headRepo, nodeID: node.id, isMine: false
-                )
+                    headRepo: node.headRepo, nodeID: node.id, isMine: false,
+                    stack: stackInfo(node.stack, entry: node.stackEntry)
+                ),
+                stack: stackInfo(node.stack, entry: node.stackEntry)
             )
         }
     }
@@ -500,7 +549,8 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         crossRepo: Bool?,
         headRepo: RepoPayload?,
         nodeID: String?,
-        isMine: Bool
+        isMine: Bool,
+        stack: StackInfo? = nil
     ) -> BranchRef? {
         guard let branch, !branch.isEmpty else { return nil }
         let head = headRepo?.fullName.flatMap(parseRepo)
@@ -512,7 +562,27 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
             branch: branch,
             headRepo: head == repo ? nil : head,
             prNodeID: nodeID,
-            isMine: isMine
+            isMine: isMine,
+            stack: stack
+        )
+    }
+
+    /// The PR's stack, bottom PR first. nil when it isn't in one, or when
+    /// GitHub's answer is too incomplete to act on (no position, members
+    /// without branches).
+    static func stackInfo(_ stack: StackPayload?, entry: StackEntryPayload?) -> StackInfo? {
+        guard let stack, let id = stack.id, let number = stack.number, let position = entry?.position else { return nil }
+        let members = (stack.entries?.values ?? [])
+            .sorted { ($0.position ?? .max) < ($1.position ?? .max) }
+            .compactMap { entry -> StackInfo.Member? in
+                guard let pr = entry.pullRequest, let nodeID = pr.id, let n = pr.number,
+                      let branch = pr.headRefName, !branch.isEmpty else { return nil }
+                return StackInfo.Member(nodeID: nodeID, number: n, branch: branch, isOpen: pr.state == "OPEN")
+            }
+        guard !members.isEmpty, position >= 1, position <= members.count else { return nil }
+        return StackInfo(
+            id: id, number: number, size: stack.size ?? members.count, position: position,
+            baseBranch: stack.baseRefName ?? "", members: members
         )
     }
 
@@ -791,8 +861,10 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
             reviewStateKnown: !reviewsUnreadable,
             branchRef: branchRef(
                 repo: repo, number: number, branch: node.branch, crossRepo: node.isCrossRepository,
-                headRepo: node.headRepo, nodeID: node.id, isMine: true
-            )
+                headRepo: node.headRepo, nodeID: node.id, isMine: true,
+                stack: stackInfo(node.stack, entry: node.stackEntry)
+            ),
+            stack: stackInfo(node.stack, entry: node.stackEntry)
         )
         return (pr, checks)
     }

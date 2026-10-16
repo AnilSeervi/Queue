@@ -31,6 +31,11 @@ import Foundation
 // ("-x"). Folders are named after the branch ("feat/x" → feat-x), with -2,
 // -3… when the name is taken.
 //
+// A stack (GitHub's stacked PRs, all in one repo) shares one worktree,
+// <clone>.worktrees/stack-<n>: opening any of its PRs switches it to that
+// PR's branch when it has no uncommitted changes, else it stays where it is
+// and says so. It goes only once every PR of the stack is merged or closed.
+//
 // Every worktree Queue adds is recorded (UserDefaults "worktreeRegistry"),
 // with each PR it was opened for. cleanup() removes the ones whose PRs were
 // all merged or closed, never any other, and only when nothing can be lost:
@@ -50,6 +55,7 @@ enum WorkspaceStep: Hashable, Sendable {
     case cloning(RepoRef)
     case fetching(branch: String)
     case addingWorktree
+    case switching(branch: String)
 
     var label: String {
         switch self {
@@ -57,6 +63,7 @@ enum WorkspaceStep: Hashable, Sendable {
         case .cloning(let repo): return "Cloning \(repo.fullName)…"
         case .fetching(let branch): return "Fetching \(branch)…"
         case .addingWorktree: return "Creating worktree…"
+        case .switching(let branch): return "Switching to \(branch)…"
         }
     }
 }
@@ -88,6 +95,16 @@ struct WorktreeRecord: Codable, Hashable, Sendable {
     /// has them (a fork PR's refs/pull head, a branch deleted after merging).
     var checkoutSHA: String
     var createdAt: Date
+    /// The stack this worktree serves, when it's one: every PR of the stack
+    /// opens here, on its own branch. nil for a single PR's worktree.
+    var stackID: String? = nil
+    /// Every PR of that stack as of the last open; cleanup waits for all.
+    var stackMemberIDs: [String]? = nil
+    /// Branches of the stack's PRs: the worktree may be on any of them.
+    var stackBranches: [String]? = nil
+
+    /// The PRs whose merge or close cleanup waits for.
+    var awaitedPRNodeIDs: [String] { Array(Set(prNodeIDs + (stackMemberIDs ?? []))).sorted() }
 }
 
 /// A local branch Queue created, until Queue deletes it (or leaves it to you).
@@ -219,6 +236,11 @@ actor WorktreeManager {
         }
 
         onStep?(.fetching(branch: ref.branch))
+        if holder == nil, let stack = ref.stack,
+           let shared = registry.worktrees.first(where: { $0.stackID == stack.id && $0.clonePath == clone.path }),
+           worktrees.contains(where: { $0.path == shared.path && !$0.isPrunable }) {
+            return try await openInStackWorktree(shared, for: ref, stack: stack, plan: plan, clone: clone, onStep: onStep)
+        }
         if let holder {
             adopt(holder.path, branch: plan.localBranch, for: ref, clonePath: clone.path)
             let url = URL(fileURLWithPath: holder.path, isDirectory: true)
@@ -235,7 +257,8 @@ actor WorktreeManager {
         let sha = try await fetch(plan.source, in: clone)
         let reusing = try await localBranchExists(plan.localBranch, in: clone)
         let folderExisted = WorkspacePath.exists(clone.worktreesFolder)
-        let path = freeWorktreePath(named: plan.folderName, in: clone, taken: worktrees.map(\.path))
+        let folderName = ref.stack.map { "stack-\($0.number)" } ?? plan.folderName
+        let path = freeWorktreePath(named: folderName, in: clone, taken: worktrees.map(\.path))
 
         onStep?(.addingWorktree)
         try await addWorktree(at: path, plan: plan, sha: sha, reusing: reusing, clone: clone)
@@ -251,7 +274,10 @@ actor WorktreeManager {
         registry.worktrees.append(WorktreeRecord(
             path: path, clonePath: clone.path, repo: ref.repo, number: ref.number, prNodeIDs: ids,
             branch: plan.localBranch, createdBranch: createdByQueue(plan.localBranch, in: clone.path),
-            checkoutSHA: sha, createdAt: Date()
+            checkoutSHA: sha, createdAt: Date(),
+            stackID: ref.stack?.id,
+            stackMemberIDs: ref.stack?.members.map(\.nodeID),
+            stackBranches: ref.stack.map { Array(Set($0.members.map(\.branch) + [plan.localBranch])).sorted() }
         ))
         let url = URL(fileURLWithPath: path, isDirectory: true)
         guard reusing else { return OpenedWorktree(url: url) }
@@ -282,6 +308,65 @@ actor WorktreeManager {
         registry = updated
     }
 
+    /// Opens `ref`'s PR in its stack's shared worktree: fetches it, then
+    /// switches the worktree to its branch — unless the worktree has
+    /// uncommitted changes, which would ride along or block, so it stays on
+    /// the branch it's on and says so.
+    private func openInStackWorktree(
+        _ shared: WorktreeRecord, for ref: BranchRef, stack: StackInfo, plan: CheckoutPlan, clone: GitClone,
+        onStep: (@Sendable (WorkspaceStep) -> Void)?
+    ) async throws -> OpenedWorktree {
+        let url = URL(fileURLWithPath: shared.path, isDirectory: true)
+        let sha = try await fetch(plan.source, in: clone)
+        tie(shared.path, toStack: stack, branch: plan.localBranch, for: ref, clonePath: clone.path)
+        let current = (try? await git.check(["rev-parse", "--abbrev-ref", "HEAD"], in: url).value) ?? shared.branch
+        let changes = try await git.check(["status", "--porcelain", "--untracked-files=no"], in: url).value
+        guard changes.isEmpty else {
+            return OpenedWorktree(url: url, note: "Stayed on \(current): the stack's worktree has uncommitted changes. Commit or stash them to switch to #\(ref.number).")
+        }
+        let reusing = try await localBranchExists(plan.localBranch, in: clone)
+        onStep?(.switching(branch: plan.localBranch))
+        func arguments(track: Bool) -> [String] {
+            // isUsableBranchName rules out names git would read as options.
+            if reusing { return ["switch", "--no-guess", plan.localBranch] }
+            if case .branch(let remote, let name) = plan.source {
+                return ["switch", track ? "--track" : "--no-track", "-c", plan.localBranch, "refs/remotes/\(remote.name)/\(name)"]
+            }
+            return ["switch", "--no-track", "-c", plan.localBranch, sha]
+        }
+        var output = try await git.run(arguments(track: true), in: url, timeout: 300)
+        if !output.succeeded, output.stderr.contains("cannot set up tracking information") {
+            output = try await git.run(arguments(track: false), in: url, timeout: 300)
+        }
+        guard output.succeeded else { throw WorkspaceError(gitFailure: output) }
+
+        if !reusing {
+            registry.branches.append(CreatedBranch(
+                clonePath: clone.path, branch: plan.localBranch, repo: ref.repo, number: ref.number,
+                prNodeIDs: ref.prNodeID.map { [$0] } ?? [], checkoutSHA: sha
+            ))
+        }
+        if let index = registry.worktrees.firstIndex(where: { $0.path == shared.path }) {
+            registry.worktrees[index].branch = plan.localBranch
+            registry.worktrees[index].createdBranch = createdByQueue(plan.localBranch, in: clone.path)
+            if !reusing { registry.worktrees[index].checkoutSHA = sha }
+        }
+        guard reusing else { return OpenedWorktree(url: url) }
+        adopt(nil, branch: plan.localBranch, for: ref, clonePath: clone.path)
+        return OpenedWorktree(url: url, note: await catchUp(shared.path, branch: plan.localBranch, to: sha, clone: clone))
+    }
+
+    /// adopt() for a stack's shared worktree, which also follows the stack:
+    /// its PRs (cleanup waits for all of them) and their branches.
+    private func tie(_ path: String, toStack stack: StackInfo, branch: String, for ref: BranchRef, clonePath: String) {
+        adopt(path, branch: branch, for: ref, clonePath: clonePath)
+        guard let index = registry.worktrees.firstIndex(where: { $0.path == path }) else { return }
+        var record = registry.worktrees[index]
+        record.stackMemberIDs = Array(Set((record.stackMemberIDs ?? []) + stack.members.map(\.nodeID))).sorted()
+        record.stackBranches = Array(Set((record.stackBranches ?? []) + stack.members.map(\.branch) + [branch])).sorted()
+        registry.worktrees[index] = record
+    }
+
     /// Brings the worktree at `path` up to the PR's head `sha` when it's
     /// behind it: a branch Queue created, in a worktree Queue added, with no
     /// uncommitted changes, is fast-forwarded (git refuses to overwrite
@@ -302,16 +387,30 @@ actor WorktreeManager {
         guard createdByQueue(branch, in: clone.path) else {
             return "Your branch \(branch) \(behind): Queue doesn't move branches it didn't create."
         }
-        guard await isAncestor(head, of: sha) else {
-            return "Its worktree \(behind): it has commits the PR doesn't (was the PR force-pushed?)."
-        }
         guard let status = try? await git.check(["status", "--porcelain", "--untracked-files=no"], in: worktree),
               status.value.isEmpty
         else { return "Its worktree \(behind): it has uncommitted changes." }
-        do {
-            try await git.check(["merge", "--ff-only", "--quiet", sha], in: worktree, timeout: 300)
-        } catch {
-            return "Its worktree \(behind): \(error.localizedDescription)"
+        if await isAncestor(head, of: sha) {
+            do {
+                try await git.check(["merge", "--ff-only", "--quiet", sha], in: worktree, timeout: 300)
+            } catch {
+                return "Its worktree \(behind): \(error.localizedDescription)"
+            }
+        } else {
+            // The PR was rewritten (a force-push, or GitHub rebasing a stack
+            // after a lower PR merged). Move the branch to the new head only
+            // when every commit on it came from GitHub, so nothing of yours
+            // is dropped; `reset --keep` refuses to touch local changes too.
+            let fetched = [registry.branches.first { $0.clonePath == clone.path && $0.branch == branch }?.checkoutSHA,
+                           registry.worktrees.first { $0.path == path }?.checkoutSHA].compactMap { $0 }
+            guard let unpushed = try? await git.check(["rev-list", "--count", "HEAD", "--not", "--remotes"] + fetched, in: worktree).value,
+                  unpushed == "0"
+            else { return "Its worktree \(behind): it has commits the PR doesn't (was the PR force-pushed?)." }
+            do {
+                try await git.check(["reset", "--keep", "--quiet", sha], in: worktree, timeout: 300)
+            } catch {
+                return "Its worktree \(behind): \(error.localizedDescription)"
+            }
         }
         if let index = registry.worktrees.firstIndex(where: { $0.path == path }) {
             registry.worktrees[index].checkoutSHA = sha
@@ -328,7 +427,7 @@ actor WorktreeManager {
     /// lifecycles and pass them to cleanup().
     func trackedPRNodeIDs() -> [String] {
         forgetMissing()
-        return Set(registry.worktrees.flatMap(\.prNodeIDs) + registry.branches.flatMap(\.prNodeIDs)).sorted()
+        return Set(registry.worktrees.flatMap(\.awaitedPRNodeIDs) + registry.branches.flatMap(\.prNodeIDs)).sorted()
     }
 
     /// The worktrees Queue added (and hasn't removed).
@@ -346,6 +445,7 @@ actor WorktreeManager {
         forgetMissing()
         // Every PR it was opened for is merged or closed.
         func isFinished(_ ids: [String]) -> Bool {
+            // (A stack's worktree passes awaitedPRNodeIDs: all its PRs.)
             !ids.isEmpty && ids.allSatisfy { id in lifecycles[id].map { $0 != .open } ?? false }
         }
         func key(_ clonePath: String, _ branch: String) -> String { clonePath + "\0" + branch }
@@ -353,7 +453,7 @@ actor WorktreeManager {
         var results: [CleanupResult] = []
         // Branches remove() already tried to delete, not to try twice.
         var tried: Set<String> = []
-        for record in registry.worktrees where isFinished(record.prNodeIDs) {
+        for record in registry.worktrees where isFinished(record.awaitedPRNodeIDs) {
             let created = registry.branches.first { $0.clonePath == record.clonePath && $0.branch == record.branch }
             let result = await remove(record, deleting: created.flatMap { isFinished($0.prNodeIDs) ? $0 : nil })
             if result.action == .removedWorktree { tried.insert(key(record.clonePath, record.branch)) }
@@ -401,7 +501,9 @@ actor WorktreeManager {
                 return keep("it's no longer a git worktree", forget: true)
             }
             if entry.isLocked { return keep("it's locked (git worktree lock)") }
-            guard entry.branch == record.branch else {
+            // A stack's worktree may be on any of the stack's branches.
+            let expected = Set([record.branch] + (record.stackBranches ?? []))
+            guard let current = entry.branch, expected.contains(current) else {
                 return keep("it has \(entry.branch ?? "a detached HEAD") checked out now")
             }
             let status = try await git.check(["status", "--porcelain", "--untracked-files=all"], in: worktree)

@@ -45,7 +45,10 @@ enum Snapshotter {
                 // Hover actions, as if the pointer were on the rows.
                 for (name, tab, preview) in hoverPreviews {
                     state.activeTab = tab
-                    snap(PanelRootView().environmentObject(state).environment(\.rowPreview, preview),
+                    // The stack's merge confirm sits at the end of My PRs.
+                    let anchor: UnitPoint? = name == "prs-merge" ? .bottom : nil
+                    snap(PanelRootView().environmentObject(state).environment(\.rowPreview, preview)
+                            .environment(\.listScrollAnchor, anchor),
                          dark: dark, to: url.appendingPathComponent("panel-\(name)-\(suffix).png"))
                 }
                 snap(SettingsView(state: state).environmentObject(state), dark: dark,
@@ -88,7 +91,7 @@ enum Snapshotter {
         return [
             ("inbox-hover", .inbox, RowPreview(hovered: ["rr-4821", "m-4790"], busy: opening)),
             ("prs-hover", .prs, RowPreview(hovered: ["pr-391", "pr-2215"])),
-            ("prs-merge", .prs, RowPreview(confirmingMerge: ["pr-2215"])),
+            ("prs-merge", .prs, RowPreview(hovered: ["pr-2231"], confirmingMerge: ["pr-2231"])),
         ]
     }
 
