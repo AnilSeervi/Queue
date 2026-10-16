@@ -13,6 +13,11 @@ final class SettingsWindowController {
     static let shared = SettingsWindowController()
 
     private var window: NSWindow?
+    private var keyObserver: NSObjectProtocol?
+
+    /// The global shortcut and whether it registered (set by AppDelegate at
+    /// launch; HotKey returns nil when another app holds the combination).
+    var globalShortcut: (combo: KeyCombo, registered: Bool) = (.togglePanel, true)
 
     /// Spec 1d: 500pt content width; height fits content (~560–620), scrolls if taller.
     private static let contentWidth: CGFloat = 500
@@ -21,13 +26,27 @@ final class SettingsWindowController {
 
     func show(state: AppState) {
         if window == nil {
-            window = makeWindow(state: state)
-            window?.center()
+            let window = makeWindow(state: state)
+            window.center()
+            // Back from System Settings (its "Open…" buttons): re-read what
+            // may have changed there while the window stayed open.
+            keyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+            ) { _ in
+                MainActor.assumeIsolated { Self.readSystemState() }
+            }
+            self.window = window
         }
-        // The user may have just flipped notifications in System Settings.
-        Notifier.shared.refreshAuthorizationStatus()
+        Self.readSystemState()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Notification permission and the login item live in System Settings,
+    /// where the user can change them at any time.
+    private static func readSystemState() {
+        Notifier.shared.refreshAuthorizationStatus()
+        LoginItem.shared.reload()
     }
 
     func closeWindow() {
@@ -104,8 +123,6 @@ private struct SettingsPalette {
     var segmentContainer: Color { dark ? Color.white.opacity(0.10) : Color.black.opacity(0.06) }
     var segmentSelected: Color { dark ? Color.white.opacity(0.25) : .white }
     var segmentText: Color { dark ? Color.white.opacity(0.6) : Color.black.opacity(0.5) }
-    var chipText: Color { dark ? Color.white.opacity(0.45) : Color.black.opacity(0.45) }
-    var chipBG: Color { dark ? Color.white.opacity(0.05) : Color.black.opacity(0.05) }
 }
 
 // MARK: - Content pane
@@ -114,8 +131,8 @@ struct SettingsContentView: View {
     @EnvironmentObject var state: AppState
     @ObservedObject var settings: SettingsStore
     @Environment(\.colorScheme) private var scheme
-    @State private var orgDraft: String = ""
     @ObservedObject private var notifier = Notifier.shared
+    @ObservedObject private var loginItem = LoginItem.shared
 
     init(state: AppState) {
         _settings = ObservedObject(wrappedValue: state.settings)
@@ -153,7 +170,7 @@ struct SettingsContentView: View {
                 hairline
                 toggleRow("New mention", isOn: $settings.notifyMentions)
                 hairline
-                toggleRow("CI fails on your PR", isOn: $settings.notifyCIFailures)
+                toggleRow("Your PR fails CI, needs changes or has conflicts", isOn: $settings.notifyCIFailures)
                 hairline
                 toggleRow("Your PR is ready to merge", isOn: $settings.notifyPRReady)
             }
@@ -165,18 +182,6 @@ struct SettingsContentView: View {
         }
         .padding(EdgeInsets(top: 16, leading: 18, bottom: 16, trailing: 18))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onChange(of: settings.launchAtLogin) { _, enabled in
-            // The SPM binary is unbundled in dev — never crash on failure.
-            do {
-                if enabled {
-                    try SMAppService.mainApp.register()
-                } else {
-                    try SMAppService.mainApp.unregister()
-                }
-            } catch {
-                print("Launch at login \(enabled ? "register" : "unregister") failed: \(error)")
-            }
-        }
         .onChange(of: settings.refreshInterval) { _, _ in
             state.startRefreshTimer()
         }
@@ -187,11 +192,6 @@ struct SettingsContentView: View {
         }
         .onChange(of: settings.alertOnCIFail) { _, _ in
             state.onStateChange?()
-        }
-        // Watched-repo changes rescope every fetch — refresh right away.
-        .onChange(of: settings.watchedRepos) { _, _ in
-            state.onStateChange?()
-            Task { await state.refresh() }
         }
     }
 
@@ -248,7 +248,7 @@ struct SettingsContentView: View {
                     Text(username)
                         .font(.system(size: 12.5, weight: .semibold))
                         .foregroundStyle(ds.textPrimary)
-                    Text("github.com · read + review scopes")
+                    Text("github.com · repo + read:org scopes")
                         .font(.system(size: 11))
                         .foregroundStyle(ds.textMeta)
                 }
@@ -281,19 +281,56 @@ struct SettingsContentView: View {
 
     // MARK: General rows
 
+    /// Reflects SMAppService, not a stored flag: removing Queue in System
+    /// Settings → Login Items (or running a copy outside Applications) shows
+    /// here. Hints stay on the row's line so the window keeps its height.
     private var launchAtLoginRow: some View {
-        toggleRow("Launch at login", isOn: $settings.launchAtLogin)
+        HStack(spacing: 8) {
+            rowLabel("Launch at login")
+            Spacer(minLength: 8)
+            if let failure = loginItem.failure {
+                Text(failure)
+                    .font(.system(size: 11))
+                    .foregroundStyle(ds.danger)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(failure)
+            } else if loginItem.status == .requiresApproval {
+                Button {
+                    SMAppService.openSystemSettingsLoginItems()
+                } label: {
+                    Text("Allow in Login Items…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(ds.link)
+                }
+                .buttonStyle(.plain)
+                .help("macOS needs your OK in System Settings → General → Login Items before Queue can open at login.")
+            }
+            Toggle("", isOn: Binding(get: { loginItem.isOn }, set: { loginItem.setEnabled($0) }))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .controlSize(.small)
+                .tint(ds.toggleOn)
+        }
+        .padding(rowPadding)
     }
 
+    /// The combination HotKey actually registered, or a warning when it
+    /// couldn't (another app holds it).
     private var shortcutRow: some View {
-        HStack(spacing: 8) {
+        let shortcut = SettingsWindowController.shared.globalShortcut
+        let label = shortcut.registered ? shortcut.combo.display : "\(shortcut.combo.display) · unavailable"
+        return HStack(spacing: 8) {
             rowLabel("Global shortcut")
             Spacer(minLength: 8)
-            Text(settings.shortcutDisplay)
+            Text(label)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(ds.textPrimary)
+                .foregroundStyle(shortcut.registered ? ds.textPrimary : ds.danger)
                 .padding(EdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6))
                 .background(pal.kbdChipBG, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .help(shortcut.registered
+                      ? "Opens Queue from any app."
+                      : "Another app already uses \(shortcut.combo.display), so it can't open Queue.")
         }
         .padding(rowPadding)
     }
@@ -339,77 +376,51 @@ struct SettingsContentView: View {
         }
         .padding(rowPadding)
     }
+}
 
-    // MARK: Watching rows
+// MARK: - Launch at login
 
-    private var organizationRow: some View {
-        HStack(spacing: 8) {
-            rowLabel("Organization")
-            Spacer(minLength: 8)
-            TextField("your repositories", text: $orgDraft)
-                .textFieldStyle(.plain)
-                .font(.system(size: 11.5, design: .monospaced))
-                .multilineTextAlignment(.trailing)
-                .frame(width: 170)
-                .padding(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
-                .background(pal.kbdChipBG, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                .onSubmit(commitOrganization)
-        }
-        .padding(rowPadding)
-        .onAppear { orgDraft = settings.organization }
+/// Queue's login item as the system reports it (SMAppService). Read when
+/// Settings opens or becomes key; never stored.
+@MainActor
+private final class LoginItem: ObservableObject {
+    static let shared = LoginItem()
+
+    @Published private(set) var status: SMAppService.Status = SMAppService.mainApp.status
+    /// Why the last change didn't take; cleared by the next attempt.
+    @Published private(set) var failure: String?
+
+    /// requiresApproval is registered and only waiting for the user's OK,
+    /// so the switch stays on (with a hint) rather than snapping back.
+    var isOn: Bool { status == .enabled || status == .requiresApproval }
+
+    func reload() {
+        let current = SMAppService.mainApp.status
+        if current != status { status = current }
+        // Fixed elsewhere (e.g. turned on in System Settings).
+        if current == .enabled, failure != nil { failure = nil }
     }
 
-    /// Commit the org, refetch the watchable repos, refresh data. Empty = the
-    /// signed-in user's own repositories.
-    private func commitOrganization() {
-        let value = orgDraft.trimmingCharacters(in: .whitespaces)
-        guard value != settings.organization else { return }
-        settings.organization = value
-        Task {
-            await state.reloadAvailableRepos()
-            await state.refresh()
+    func setEnabled(_ enabled: Bool) {
+        failure = nil
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            failure = enabled ? Self.registerFailure(error) : "Couldn't turn off — \(error.localizedDescription)"
         }
+        reload()
     }
 
-    private var repoChipsRow: some View {
-        ChipFlowLayout(spacing: 6) {
-            ForEach(settings.availableRepos) { watchable in
-                repoChip(watchable)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(rowPadding)
-    }
-
-    private func repoChip(_ watchable: WatchableRepo) -> some View {
-        let fullName = watchable.repo.fullName
-        let selected = settings.watchedRepos.contains(fullName)
-        return Button {
-            withAnimation(.easeOut(duration: 0.15)) {
-                if selected {
-                    settings.watchedRepos.remove(fullName)
-                } else {
-                    settings.watchedRepos.insert(fullName)
-                }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                if selected {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 8, weight: .semibold))
-                }
-                Text(fullName)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(selected ? ds.link : pal.chipText)
-            .padding(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
-            .background(
-                selected ? ds.link.opacity(0.10) : pal.chipBG,
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-            )
-        }
-        .buttonStyle(.plain)
+    /// Registering fails for a copy macOS won't keep as a login item: run
+    /// from a disk image or Downloads (translocated), or an unbundled build.
+    private static func registerFailure(_ error: Error) -> String {
+        let bundle = Bundle.main
+        let installed = bundle.bundleIdentifier != nil && bundle.bundlePath.contains("/Applications/")
+        return installed ? "Couldn't turn on — \(error.localizedDescription)" : "Move Queue to Applications to enable"
     }
 }
 
@@ -452,51 +463,6 @@ private struct BadgeSegmentedControl: View {
         case .count: return "Count"
         case .dot: return "Dot"
         case .off: return "Off"
-        }
-    }
-}
-
-// MARK: - Chip flow layout (wraps repo chips at the card width)
-
-private struct ChipFlowLayout: Layout {
-    var spacing: CGFloat = 6
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let maxWidth = proposal.width ?? .infinity
-        var x: CGFloat = 0
-        var y: CGFloat = 0
-        var rowHeight: CGFloat = 0
-        var usedWidth: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x > 0, x + size.width > maxWidth {
-                x = 0
-                y += rowHeight + spacing
-                rowHeight = 0
-            }
-            x += size.width
-            usedWidth = max(usedWidth, x)
-            x += spacing
-            rowHeight = max(rowHeight, size.height)
-        }
-        let width = maxWidth.isFinite ? maxWidth : usedWidth
-        return CGSize(width: width, height: y + rowHeight)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        var x = bounds.minX
-        var y = bounds.minY
-        var rowHeight: CGFloat = 0
-        for subview in subviews {
-            let size = subview.sizeThatFits(.unspecified)
-            if x > bounds.minX, x + size.width > bounds.maxX {
-                x = bounds.minX
-                y += rowHeight + spacing
-                rowHeight = 0
-            }
-            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
-            x += size.width + spacing
-            rowHeight = max(rowHeight, size.height)
         }
     }
 }

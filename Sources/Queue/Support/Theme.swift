@@ -88,7 +88,6 @@ enum DSFont {
     static func statNumber() -> Font { .system(size: 20, weight: .semibold) }       // 20 stat number
     static func statCaption() -> Font { .system(size: 10.5) }
     static func onboardingTitle() -> Font { .system(size: 16, weight: .semibold) }
-    static func onboardingTitleSmall() -> Font { .system(size: 15, weight: .semibold) }
     static func onboardingBody() -> Font { .system(size: 11.5) }
     static func deviceCode() -> Font { .system(size: 24, weight: .semibold, design: .monospaced) }
     static func avatarInitials() -> Font { .system(size: 8, weight: .bold) }

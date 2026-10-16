@@ -1,12 +1,17 @@
 import SwiftUI
 
 // Inbox tab: review requests + mentions grouped by repo (spec 1a "Inbox tab",
-// screenshot 01). Rows come from the shared RowKit scaffolding; approve/snooze
-// are optimistic — AppState removes the row immediately and restores on failure.
+// screenshot 01). Rows come from the shared RowKit scaffolding; approve is
+// optimistic — AppState removes the row immediately and restores on failure.
+// Opening a mention (row click, ↗) or ✓ Done marks its thread read. At the
+// end, "Done · N" opens what you've dealt with this week (DoneSection).
 
 struct InboxView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) private var scheme
+
+    /// The Inbox is review requests + mentions; it's "clear" only once both loaded.
+    private static let sections: Set<SnapshotSection> = [.reviews, .mentions]
 
     /// Approve button fg — spec: dark #7ee2a0, light ds.success.
     private var approveColor: Color {
@@ -19,38 +24,34 @@ struct InboxView: View {
 
     var body: some View {
         let ds = DS(scheme)
-        let entries = state.visibleInbox
-        let hasSummaryLines = state.approvedThisSession > 0
-            || state.snoozedVisibleCount > 0
-            || state.inlineError != nil
+        let entries = state.inbox
 
-        if entries.isEmpty && !hasSummaryLines {
-            EmptyStateLine(text: "Nothing needs you ✓")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
+        VStack(spacing: 0) {
+            if entries.isEmpty {
+                EmptyListTab(tab: .inbox, sections: Self.sections, text: "Nothing needs you ✓") {
+                    approvedLine
+                    DoneSection(tab: .inbox, items: state.doneInbox)
+                }
+            } else {
+                ListScrollView(tab: .inbox) {
                     ForEach(groupByRepo(entries, repo: { $0.repo }), id: \.repo) { group in
                         RepoGroupHeader(repo: group.repo, count: group.items.count)
                         ForEach(group.items) { entry in
                             row(for: entry, ds: ds)
                         }
                     }
-
-                    if state.approvedThisSession > 0 {
-                        ApprovedSummaryLine(count: state.approvedThisSession)
-                    }
-                    if state.snoozedVisibleCount > 0 {
-                        SnoozedSummaryLine(count: state.snoozedVisibleCount) {
-                            withAnimation(.easeOut(duration: 0.15)) { state.undoSnooze() }
-                        }
-                    }
-                    if let error = state.inlineError {
-                        InlineErrorLine(text: error)
-                    }
+                    approvedLine
+                    DoneSection(tab: .inbox, items: state.doneInbox)
                 }
-                .padding(.bottom, 6)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
+            TabStatusLines()
+        }
+    }
+
+    @ViewBuilder private var approvedLine: some View {
+        if state.approvedThisSession > 0 {
+            ApprovedSummaryLine(count: state.approvedThisSession)
         }
     }
 
@@ -63,6 +64,7 @@ struct InboxView: View {
             QueueRow(
                 title: request.title,
                 meta: request.meta,
+                onOpen: { state.open(request.url) },
                 leading: {
                     PRGlyph(color: request.age.isStale ? ds.attention : ds.success)
                 },
@@ -73,43 +75,56 @@ struct InboxView: View {
                     TextActionButton(
                         label: "Approve",
                         color: approveColor,
-                        background: approveBackground
+                        background: approveBackground,
+                        help: approveHelp(request)
                     ) {
                         withAnimation(.easeOut(duration: 0.15)) { state.approve(request) }
                     }
-                    snoozeButton(id: request.id)
-                    openButton(url: request.url)
+                    openButton { state.open(request.url) }
                 }
             )
         case .mention(let mention):
             QueueRow(
                 title: mention.title,
                 meta: mention.meta,
+                onOpen: { open(mention) },
                 leading: {
-                    AvatarView(user: mention.author)
+                    if let author = mention.author {
+                        AvatarView(user: author)
+                    } else {
+                        Image(systemName: "bubble.left")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ds.textFaint)
+                    }
                 },
                 trailing: {
                     AgeText(age: mention.age)
                 },
                 actions: {
-                    snoozeButton(id: mention.id)
-                    openButton(url: mention.url)
+                    IconActionButton(systemName: "checkmark", help: "Done — mark as read") {
+                        withAnimation(.easeOut(duration: 0.15)) { state.markRead(mention) }
+                    }
+                    openButton { open(mention) }
                 }
             )
         }
     }
 
-    // MARK: Shared hover actions
-
-    private func snoozeButton(id: String) -> some View {
-        IconActionButton(systemName: "clock", help: "Snooze until tomorrow 9 AM") {
-            withAnimation(.easeOut(duration: 0.15)) { state.snooze(id: id) }
-        }
+    /// Names the commit the approval is pinned to, when known.
+    private func approveHelp(_ request: ReviewRequest) -> String {
+        guard let sha = request.headSHA else { return "Approve this pull request" }
+        return "Approve at commit \(sha.prefix(7))"
     }
 
-    private func openButton(url: URL) -> some View {
-        IconActionButton(systemName: "arrow.up.right", help: "Open on GitHub") {
-            state.open(url)
-        }
+    /// Opening a mention deals with it: the thread is marked read too.
+    private func open(_ mention: Mention) {
+        state.open(mention.url)
+        state.markRead(mention)
+    }
+
+    // MARK: Shared hover actions
+
+    private func openButton(action: @escaping () -> Void) -> some View {
+        IconActionButton(systemName: "arrow.up.right", help: "Open on GitHub", action: action)
     }
 }

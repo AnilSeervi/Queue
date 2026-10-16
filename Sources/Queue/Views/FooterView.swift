@@ -1,8 +1,10 @@
 import SwiftUI
 
-/// Footer: "Up next" — the oldest item that needs you, clickable to open on
-/// GitHub (replaces the spec's per-repo CI strip: zero setup, serves the
-/// triage loop directly). Right side: time-since-refresh + Settings gear.
+/// Footer: "Up next" — the oldest item that needs you (review requests,
+/// mentions, and your PRs with failing CI, changes requested or conflicts),
+/// clickable to open on GitHub (replaces the spec's per-repo CI strip: zero
+/// setup, serves the triage loop directly). Right side: time-since-refresh +
+/// Settings gear.
 struct FooterView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) private var scheme
@@ -17,7 +19,7 @@ struct FooterView: View {
                         .font(DSFont.capsLabel())
                         .foregroundStyle(ds.dark ? Color.white.opacity(0.45) : Color.black.opacity(0.45))
                     Button {
-                        state.open(next.url)
+                        open(next.url)
                     } label: {
                         HStack(spacing: 5) {
                             Text(next.title)
@@ -32,14 +34,15 @@ struct FooterView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("Open on GitHub")
+                    .help("\(next.title)\nOpen on GitHub")
                 } else {
-                    Text("All clear ✓")
+                    // Not "All clear" until the badge's sections have loaded.
+                    Text(state.hasLoaded ? "All clear ✓" : TabEmptyState.notLoadedText(state))
                         .font(DSFont.pill())
                         .foregroundStyle(ds.textFaint)
                 }
                 Spacer(minLength: 8)
-                RefreshLabel(lastRefreshedAt: state.lastRefreshedAt) {
+                RefreshLabel(lastRefreshedAt: state.lastRefreshedAt, isRefreshing: state.isRefreshing) {
                     Task { await state.refresh() }
                 }
                 Button {
@@ -56,11 +59,22 @@ struct FooterView: View {
             .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
         }
     }
+
+    /// Opening a mention from here marks it read, as its row does.
+    private func open(_ url: URL) {
+        state.open(url)
+        for case .mention(let mention) in state.inbox where mention.url == url {
+            state.markRead(mention)
+            break
+        }
+    }
 }
 
 /// "↻ 30s" — time since last refresh, ticking; click = manual refresh.
+/// Dimmed and disabled while a refresh is running.
 private struct RefreshLabel: View {
     var lastRefreshedAt: Date?
+    var isRefreshing: Bool
     var onRefresh: () -> Void
     @Environment(\.colorScheme) private var scheme
 
@@ -75,10 +89,12 @@ private struct RefreshLabel: View {
                         .font(DSFont.pill())
                 }
                 .foregroundStyle(ds.dark ? Color.white.opacity(0.45) : Color.black.opacity(0.45))
+                .opacity(isRefreshing ? 0.5 : 1)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Refresh now")
+            .disabled(isRefreshing)
+            .help(isRefreshing ? "Refreshing…" : "Refresh now")
         }
     }
 

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Panel tab bar: Inbox · My PRs · Issues · Stats + snooze-all button (spec 1a §1).
+/// Panel tab bar: Inbox · My PRs · Issues · Stats (spec 1a §1).
 struct TabBarView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) private var scheme
@@ -15,15 +15,6 @@ struct TabBarView: View {
                     }
                 }
                 Spacer(minLength: 0)
-                Button {
-                    state.snoozeAll()
-                } label: {
-                    SnoozeClockIcon(color: ds.dark ? Color.white.opacity(0.45) : Color.black.opacity(0.45), size: 14)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Snooze all until tomorrow")
             }
             .padding(EdgeInsets(top: 9, leading: 10, bottom: 8, trailing: 10))
             Rectangle().fill(ds.hairline).frame(height: 1)

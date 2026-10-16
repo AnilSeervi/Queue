@@ -1,7 +1,8 @@
 import AppKit
 import SwiftUI
 
-// Onboarding (spec 1e) — two popover-sized cards, 320px wide, always dark.
+// Onboarding (spec 1e) — popover-sized sign-in cards (device code or access
+// token), 320px wide, always dark.
 // PanelRootView swaps this in while not signed in and draws the panel chrome
 // (radius / border / material); this view draws its own near-opaque dark bg.
 
@@ -14,10 +15,11 @@ private enum OB {
     static let cardBackground = Color(.sRGB, red: 30/255, green: 31/255, blue: 36/255, opacity: 0.97)
 
     static let monoURLFont = Font.system(size: 11.5, design: .monospaced)     // github.com/login/device
-    static let primaryButtonFont = Font.system(size: 12.5, weight: .semibold) // Open GitHub / Start watching
-    static let footnoteFont = Font.system(size: 10.5)                         // Keychain note / "3 of 5 repos"
-    static let repoRowFont = Font.system(size: 11, design: .monospaced)       // repo fullName
-    static let openPRsFont = Font.system(size: 10)                            // "62 open PRs"
+    static let primaryButtonFont = Font.system(size: 12.5, weight: .semibold) // Open GitHub / Sign in
+    static let footnoteFont = Font.system(size: 10.5)                         // Keychain note
+
+    /// Both cards: what the sign-in asks for, and why.
+    static let scopesNote = "Requests repo + read:org (needed to approve and merge). Token stays in your Keychain."
 
     static let crossfade = Animation.easeOut(duration: 0.15)
 }
@@ -27,15 +29,11 @@ private enum OB {
 struct OnboardingView: View {
     @EnvironmentObject var state: AppState
 
-    /// 1 = sign-in card (signedOut placeholder or deviceFlow), 2 = repo picker.
-    private var stepIndex: Int {
-        if case .pickingRepos = state.auth { return 2 }
-        return 1
-    }
-
     var body: some View {
         ZStack {
-            if state.tokenEntryActive {
+            // Without an OAuth client ID (a downloaded release) there's no
+            // code to show: token entry is the only way in.
+            if state.tokenEntryActive || !state.supportsDeviceFlow {
                 TokenStepView()
                     .transition(.opacity)
             } else {
@@ -47,9 +45,6 @@ struct OnboardingView: View {
             case .deviceFlow(let info):
                 SignInStepView(info: info)
                     .transition(.opacity)
-            case .pickingRepos(let repos):
-                RepoPickerStepView(repos: repos, initialSelection: initialSelection(for: repos))
-                    .transition(.opacity)
             case .signedIn:
                 EmptyView() // PanelRootView won't show onboarding then.
             }
@@ -59,15 +54,7 @@ struct OnboardingView: View {
         .frame(width: OB.cardWidth)
         .background(OB.cardBackground)
         .environment(\.colorScheme, .dark) // spec 1e: onboarding is always dark
-        .animation(OB.crossfade, value: stepIndex)
         .animation(OB.crossfade, value: state.tokenEntryActive)
-    }
-
-    /// settings.watchedRepos ∩ repos; fallback: first 3.
-    private func initialSelection(for repos: [WatchableRepo]) -> Set<String> {
-        let available = Set(repos.map(\.id))
-        let fromSettings = state.settings.watchedRepos.intersection(available)
-        return fromSettings.isEmpty ? Set(repos.prefix(3).map(\.id)) : fromSettings
     }
 }
 
@@ -149,30 +136,33 @@ private struct SignInStepView: View {
             .buttonStyle(.plain)
             .padding(.top, 16)
 
-            Text("Read + review scopes only. Token stays in your Keychain.")
+            Text(OB.scopesNote)
                 .font(OB.footnoteFont)
                 .foregroundStyle(Color.white.opacity(0.35))
                 .multilineTextAlignment(.center)
                 .padding(.top, 12)
 
-            // Sign-in failures (e.g. missing OAuth client ID) surface here
-            // with a retry — otherwise the card sits on the placeholder code
-            // with no explanation.
+            // Sign-in failures surface here with a retry — otherwise the card
+            // sits on the placeholder code with no explanation. "Session
+            // expired" only says why the card is back; a new code is already
+            // on its way, so there's nothing to retry.
             if let error = state.inlineError {
                 VStack(spacing: 6) {
                     Text(error)
                         .font(OB.footnoteFont)
                         .foregroundStyle(Color(hex: 0xFF7369))
                         .multilineTextAlignment(.center)
-                    Button {
-                        state.beginSignIn()
-                    } label: {
-                        Text("Try again")
-                            .font(OB.footnoteFont.weight(.semibold))
-                            .foregroundStyle(Color.white.opacity(0.7))
-                            .underline()
+                    if info == nil, error != AppState.sessionExpiredMessage {
+                        Button {
+                            state.beginSignIn()
+                        } label: {
+                            Text("Try again")
+                                .font(OB.footnoteFont.weight(.semibold))
+                                .foregroundStyle(Color.white.opacity(0.7))
+                                .underline()
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.top, 10)
             }
@@ -228,7 +218,7 @@ private struct TokenStepView: View {
                 .foregroundStyle(.white)
                 .padding(.top, 14)
 
-            Text("Create a classic token with the repo and read:org scopes, then paste it below.")
+            Text("Create a classic token, then paste it below.")
                 .font(DSFont.onboardingBody())
                 .foregroundStyle(Color.white.opacity(0.55))
                 .multilineTextAlignment(.center)
@@ -296,21 +286,29 @@ private struct TokenStepView: View {
                     .padding(.top, 10)
             }
 
-            Text("Stored in your Keychain only.")
-                .font(OB.footnoteFont)
-                .foregroundStyle(Color.white.opacity(0.35))
-                .padding(.top, 12)
-
-            Button {
-                state.showCodeEntry()
-            } label: {
-                Text("Sign in with a code instead")
-                    .font(OB.footnoteFont.weight(.semibold))
-                    .foregroundStyle(Color.white.opacity(0.7))
-                    .underline()
+            VStack(spacing: 4) {
+                Text(OB.scopesNote)
+                // SAML orgs hide their items until the token is authorized.
+                Text("Org uses SSO? On the token page: Configure SSO → Authorize.")
             }
-            .buttonStyle(.plain)
-            .padding(.top, 14)
+            .font(OB.footnoteFont)
+            .foregroundStyle(Color.white.opacity(0.35))
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 12)
+
+            if state.supportsDeviceFlow {
+                Button {
+                    state.showCodeEntry()
+                } label: {
+                    Text("Sign in with a code instead")
+                        .font(OB.footnoteFont.weight(.semibold))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                        .underline()
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 14)
+            }
         }
         .onAppear { fieldFocused = true }
     }
@@ -320,124 +318,5 @@ private struct TokenStepView: View {
         let value = token
         token = ""   // never keep the secret in view state longer than needed
         state.signInWithToken(value)
-    }
-}
-
-// MARK: - Step 2 — Choose what to watch
-
-private struct RepoPickerStepView: View {
-    @EnvironmentObject var state: AppState
-    @Environment(\.colorScheme) private var scheme
-    var repos: [WatchableRepo]
-    @State private var selected: Set<String>
-
-    init(repos: [WatchableRepo], initialSelection: Set<String>) {
-        self.repos = repos
-        _selected = State(initialValue: initialSelection)
-    }
-
-    var body: some View {
-        let ds = DS(scheme)
-        VStack(alignment: .leading, spacing: 0) {
-            Text("Choose what to watch")
-                .font(DSFont.onboardingTitleSmall())
-                .foregroundStyle(.white)
-            Text("For the main-branch CI strip — change anytime in Settings.")
-                .font(DSFont.onboardingBody())
-                .foregroundStyle(Color.white.opacity(0.55))
-                .padding(.top, 3)
-
-            VStack(spacing: 6) {
-                ForEach(repos) { repo in
-                    RepoPickRow(repo: repo, isSelected: selected.contains(repo.id)) {
-                        withAnimation(OB.crossfade) {
-                            if selected.contains(repo.id) {
-                                selected.remove(repo.id)
-                            } else {
-                                selected.insert(repo.id)
-                            }
-                        }
-                    }
-                }
-            }
-            .padding(.top, 12)
-
-            HStack(spacing: 8) {
-                Text("\(selected.count) of \(repos.count) repo\(repos.count == 1 ? "" : "s")")
-                    .font(OB.footnoteFont)
-                    .foregroundStyle(Color.white.opacity(0.45))
-                Spacer(minLength: 0)
-                Button {
-                    state.completeOnboarding(selectedRepos: selected)
-                } label: {
-                    Text("Start watching")
-                        .font(OB.primaryButtonFont)
-                        .foregroundStyle(.white)
-                        .padding(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                        .background(ds.link, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.top, 14)
-        }
-    }
-}
-
-/// One checklist row: 15px checkbox, mono repo name, right-aligned open-PR count.
-private struct RepoPickRow: View {
-    var repo: WatchableRepo
-    var isSelected: Bool
-    var toggle: () -> Void
-    @Environment(\.colorScheme) private var scheme
-
-    var body: some View {
-        Button(action: toggle) {
-            HStack(spacing: 10) {
-                checkbox
-                Text(repo.repo.fullName)
-                    .font(OB.repoRowFont)
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .layoutPriority(1)
-                Spacer(minLength: 6)
-                Text("\(repo.openPRs) open PR\(repo.openPRs == 1 ? "" : "s")")
-                    .font(OB.openPRsFont)
-                    .foregroundStyle(Color.white.opacity(0.45))
-                    .fixedSize()
-            }
-            .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isSelected ? Color.white.opacity(0.06) : Color.clear)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(isSelected ? Color.white.opacity(0.14) : Color.clear, lineWidth: 1)
-            )
-            .opacity(isSelected ? 1 : 0.55)
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        }
-        .buttonStyle(.plain)
-    }
-
-    @ViewBuilder
-    private var checkbox: some View {
-        let ds = DS(scheme)
-        Group {
-            if isSelected {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .fill(ds.link)
-                    .overlay(
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.white)
-                    )
-            } else {
-                RoundedRectangle(cornerRadius: 4, style: .continuous)
-                    .strokeBorder(Color.white, lineWidth: 1.5)
-            }
-        }
-        .frame(width: 15, height: 15)
     }
 }

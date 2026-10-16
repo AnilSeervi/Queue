@@ -4,10 +4,12 @@ import SwiftUI
 //  1. This week — reviews given, PRs opened/merged, 7-day activity, streak
 //     (GitHub contribution data).
 //  2. Waiting on you — review requests bucketed by age, oldest one linked.
-//  3. Your PRs waiting on others — open, non-draft PRs short of approvals.
+//  3. Your PRs waiting on others — open, non-draft PRs that aren't ready
+//     and aren't waiting on you (failing CI, changes requested, conflicts).
 //  4. Review & CI — median time to first review, CI pass rate.
-// Sections 2–3 derive live from the inbox / PR lists so they track snoozes
-// and approvals; 1 and 4 come from StatsData.
+// Sections 2–3 derive live from the inbox / PR lists so they track
+// approvals; 1 and 4 come from StatsData. Until a section's data has
+// loaded it says so rather than showing an empty (all-clear) state.
 
 struct StatsView: View {
     @EnvironmentObject var state: AppState
@@ -25,17 +27,29 @@ struct StatsView: View {
 
     var body: some View {
         let ds = DS(scheme)
-        ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: 18) {
-                thisWeek(ds)
-                waitingOnYou(ds)
-                yourPRsWaiting(ds)
-                reviewAndCI(ds)
+        VStack(spacing: 0) {
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 18) {
+                    thisWeek(ds)
+                    waitingOnYou(ds)
+                    yourPRsWaiting(ds)
+                    reviewAndCI(ds)
+                }
+                .padding(DSMetric.gutter)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .padding(DSMetric.gutter)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .animation(.easeOut(duration: 0.15), value: state.stats)
+            // Stale or missing numbers say why, as on the list tabs.
+            if let error = state.inlineError {
+                InlineErrorLine(text: error)
+            }
         }
-        .animation(.easeOut(duration: 0.15), value: state.stats)
+    }
+
+    /// "Loading…" until `section` has loaded once (nil once it has).
+    private func notLoaded(_ section: SnapshotSection) -> String? {
+        state.loadedSections.contains(section) ? nil : TabEmptyState.notLoadedText(state)
     }
 
     // MARK: 1 · This week
@@ -54,7 +68,7 @@ struct StatsView: View {
                 activityBars(stats.activity, ds: ds)
                     .padding(.top, 4)
             } else {
-                placeholder("Loading…", ds: ds)
+                placeholder(TabEmptyState.notLoadedText(state), ds: ds)
             }
         }
     }
@@ -97,7 +111,7 @@ struct StatsView: View {
     // MARK: 2 · Waiting on you
 
     private var reviewRequests: [ReviewRequest] {
-        state.visibleInbox.compactMap {
+        state.inbox.compactMap {
             if case .review(let request) = $0 { return request }
             return nil
         }
@@ -118,7 +132,9 @@ struct StatsView: View {
                 trailing: requests.isEmpty ? nil : "\(requests.count) review request\(requests.count == 1 ? "" : "s")",
                 ds: ds
             )
-            if requests.isEmpty {
+            if let notLoaded = notLoaded(.reviews), requests.isEmpty {
+                placeholder(notLoaded, ds: ds)
+            } else if requests.isEmpty {
                 placeholder("Nothing waiting on you ✓", ds: ds)
             } else {
                 agingBar(segments: [(fresh, ds.success), (aging, ds.attention), (stale, ds.danger)])
@@ -173,8 +189,10 @@ struct StatsView: View {
 
     @ViewBuilder
     private func yourPRsWaiting(_ ds: DS) -> some View {
-        let waiting = state.visiblePRs
-            .filter { !$0.isDraft && $0.approvals < $0.requiredApprovals }
+        // Blocked PRs (changes requested, conflicts) and failing ones wait on
+        // you, not on reviewers; ready ones wait on your Merge.
+        let waiting = state.prs
+            .filter { !$0.isDraft && !$0.isReady && !$0.needsYou }
             .sorted { $0.age.date < $1.age.date }   // longest-waiting first
 
         VStack(alignment: .leading, spacing: 6) {
@@ -183,7 +201,9 @@ struct StatsView: View {
                 trailing: waiting.isEmpty ? nil : "\(waiting.count)",
                 ds: ds
             )
-            if waiting.isEmpty {
+            if let notLoaded = notLoaded(.prs), waiting.isEmpty {
+                placeholder(notLoaded, ds: ds)
+            } else if waiting.isEmpty {
                 placeholder("No open PRs waiting on review", ds: ds)
             } else {
                 ForEach(waiting.prefix(Metric.maxWaitingRows)) { pr in
@@ -198,8 +218,11 @@ struct StatsView: View {
         }
     }
 
+    /// "1 approval · waiting on tkole", "No approvals · no reviewers requested".
     private func waitingMeta(_ pr: MyPR) -> String {
-        let approvals = "\(pr.approvals)/\(pr.requiredApprovals) approvals"
+        let approvals = pr.approvals == 0
+            ? "No approvals"
+            : "\(pr.approvals) approval\(pr.approvals == 1 ? "" : "s")"
         guard !pr.requestedReviewers.isEmpty else { return "\(approvals) · no reviewers requested" }
         return "\(approvals) · waiting on \(pr.requestedReviewers.joined(separator: ", "))"
     }
@@ -228,7 +251,7 @@ struct StatsView: View {
                 }
                 .fixedSize(horizontal: false, vertical: true)
             } else {
-                placeholder("Loading…", ds: ds)
+                placeholder(TabEmptyState.notLoadedText(state), ds: ds)
             }
         }
     }
@@ -292,10 +315,12 @@ struct StatsView: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(ds.textPrimary)
                         .lineLimit(1)
+                        .help(title)
                     Text(meta)
                         .font(DSFont.meta())
                         .foregroundStyle(ds.textMeta)
                         .lineLimit(1)
+                        .help(meta)
                 }
                 Spacer(minLength: 8)
                 AgeText(age: age)

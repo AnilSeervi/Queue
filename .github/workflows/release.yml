@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag like v0.1.0 → builds Queue.app, zips it, and attaches it to a
-# GitHub release with generated notes.
+# Push a tag like v0.1.0 → builds Queue.app, launches it once in demo
+# snapshot mode as a smoke test, zips it, and attaches the zip plus its
+# SHA-256 to a GitHub release with generated notes.
 on:
   push:
     tags: ["v*"]
@@ -9,22 +10,68 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash # = bash --noprofile --norc -eo pipefail
+
+env:
+  # Pinned (with the runner below) so an image update can't silently change
+  # the toolchain. Bump both together; the runner keeps this path as a
+  # symlink when a patch release (26.6.1) replaces it.
+  XCODE_APP: /Applications/Xcode_26.6.app
+
 jobs:
   release:
-    runs-on: macos-latest
+    runs-on: macos-26
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # CFBundleShortVersionString must be three integers, so only vX.Y.Z.
+      - name: Check the tag is a release version
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not a release tag like v1.2.3"
+            exit 1
+          fi
 
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode
+        run: |
+          if [[ ! -d "$XCODE_APP" ]]; then
+            echo "::error::$XCODE_APP is not on this runner image. Installed:"
+            ls -d /Applications/Xcode_*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP"
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      # The run number is the build number: it only goes up, and it needs no
+      # git history (the checkout is shallow).
       - name: Build Queue.app
-        run: QUEUE_VERSION="${GITHUB_REF_NAME#v}" bash scripts/bundle.sh release
+        run: |
+          QUEUE_VERSION="${GITHUB_REF_NAME#v}" QUEUE_BUILD="$GITHUB_RUN_NUMBER" \
+            bash scripts/bundle.sh release
 
-      - name: Zip (ditto preserves the bundle structure)
-        run: ditto -c -k --keepParent build/Queue.app "Queue-${GITHUB_REF_NAME}.zip"
+      - name: Smoke test (launch in demo snapshot mode)
+        timeout-minutes: 5
+        run: bash scripts/smoke-test.sh build/Queue.app "$RUNNER_TEMP/snap"
+
+      - name: Zip (ditto preserves the bundle structure) and checksum
+        run: |
+          ZIP="Queue-${GITHUB_REF_NAME}.zip"
+          ditto -c -k --keepParent build/Queue.app "$ZIP"
+          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "Queue-${GITHUB_REF_NAME}.zip" \
+          gh release create "$GITHUB_REF_NAME" \
+            "Queue-${GITHUB_REF_NAME}.zip" "Queue-${GITHUB_REF_NAME}.zip.sha256" \
             --title "Queue $GITHUB_REF_NAME" \
             --generate-notes

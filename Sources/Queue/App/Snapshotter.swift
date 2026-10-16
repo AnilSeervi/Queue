@@ -3,10 +3,22 @@ import SwiftUI
 
 /// Dev tool: QUEUE_SNAPSHOT=<dir> renders every surface to PNGs offscreen and
 /// exits. No screen-recording permission needed (draws the app's own views).
+/// QUEUE_ICON=<dir> instead writes the app icon as <dir>/Queue.iconset and
+/// exits (scripts/make-icon.sh turns that into Resources/Queue.icns).
 @MainActor
 enum Snapshotter {
     static func runIfRequested(state: AppState) -> Bool {
-        guard let dir = ProcessInfo.processInfo.environment["QUEUE_SNAPSHOT"] else { return false }
+        let env = ProcessInfo.processInfo.environment
+        if let dir = env["QUEUE_ICON"] {
+            let iconset = URL(fileURLWithPath: dir, isDirectory: true).appendingPathComponent("Queue.iconset")
+            guard writeIconSet(to: iconset) else {
+                FileHandle.standardError.write(Data("Queue: could not write \(iconset.path)\n".utf8))
+                exit(1)
+            }
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+            return true
+        }
+        guard let dir = env["QUEUE_SNAPSHOT"] else { return false }
         let url = URL(fileURLWithPath: dir, isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
 
@@ -22,29 +34,37 @@ enum Snapshotter {
                     snap(PanelRootView().environmentObject(state), dark: dark,
                          to: url.appendingPathComponent("panel-\(tab.rawValue)-\(suffix).png"))
                 }
+                // The Done sections opened, scrolled to the end.
+                state.expandedDone = [.inbox, .prs]
+                for tab in [PanelTab.inbox, .prs] {
+                    state.activeTab = tab
+                    snap(PanelRootView().environmentObject(state).environment(\.listScrollAnchor, .bottom),
+                         dark: dark, to: url.appendingPathComponent("panel-\(tab.rawValue)-done-\(suffix).png"))
+                }
+                state.expandedDone = []
                 snap(SettingsView(state: state).environmentObject(state), dark: dark,
                      to: url.appendingPathComponent("settings-\(suffix).png"))
             }
             state.activeTab = savedTab
 
-            // Onboarding (always dark) — both steps, driven by auth state.
+            // Onboarding (always dark) — device code, then token entry.
             let savedAuth = state.auth
             state.auth = .deviceFlow(DeviceFlowInfo(
                 userCode: "7F3A-D21B",
                 verificationURL: URL(string: "https://github.com/login/device")!))
             snap(PanelRootView().environmentObject(state), dark: true,
                  to: url.appendingPathComponent("onboarding-step1.png"))
-            state.auth = .pickingRepos(MockData.watchableRepos)
-            snap(PanelRootView().environmentObject(state), dark: true,
-                 to: url.appendingPathComponent("onboarding-step2.png"))
             state.tokenEntryActive = true
             snap(PanelRootView().environmentObject(state), dark: true,
                  to: url.appendingPathComponent("onboarding-token.png"))
             state.tokenEntryActive = false
             state.auth = savedAuth
 
-            // Menu bar icon states (both appearances).
+            // Menu bar icon states (both appearances), plus the app icon.
             snapIconStates(to: url)
+            if let icon = appIcon(pixels: 1024) {
+                writePNG(NSBitmapImageRep(cgImage: icon), to: url.appendingPathComponent("app-icon.png"))
+            }
 
             NSApp.terminate(nil)
         }
@@ -86,7 +106,6 @@ enum Snapshotter {
             ("count-ci", .needsYouCount(4, ciFailing: true)),
             ("dot", .needsYouDot),
             ("ci-failing", .ciFailing),
-            ("snoozed", .snoozed),
         ]
         for dark in [true, false] {
             let suffix = dark ? "dark" : "light"
@@ -119,5 +138,131 @@ enum Snapshotter {
         NSRect(origin: .zero, size: image.size).fill(using: .sourceAtop)
         tinted.unlockFocus()
         return tinted
+    }
+
+    // MARK: App icon
+
+    /// Every file `iconutil -c icns` expects: (name, pixels, points).
+    private static let iconSetSizes: [(String, Int, Int)] = [16, 32, 128, 256, 512].flatMap { pt in
+        [("icon_\(pt)x\(pt).png", pt, pt), ("icon_\(pt)x\(pt)@2x.png", pt * 2, pt)]
+    }
+
+    private static func writeIconSet(to dir: URL) -> Bool {
+        try? FileManager.default.removeItem(at: dir)
+        guard (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil
+        else { return false }
+        for (name, pixels, points) in iconSetSizes {
+            guard let image = appIcon(pixels: pixels) else { return false }
+            let rep = NSBitmapImageRep(cgImage: image)
+            rep.size = NSSize(width: points, height: points) // 72 dpi at 1x, 144 at @2x
+            guard writePNG(rep, to: dir.appendingPathComponent(name)) else { return false }
+        }
+        return true
+    }
+
+    @discardableResult
+    private static func writePNG(_ rep: NSBitmapImageRep, to url: URL) -> Bool {
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        return (try? data.write(to: url)) != nil
+    }
+
+    /// The Dock/Finder icon: the menu-bar PR glyph in white on the dark panel
+    /// color, with the amber "needs you" dot. Shape and margins follow Apple's
+    /// macOS grid: an 824pt continuous-corner squircle centered in a 1024pt
+    /// canvas, its drop shadow in the margin.
+    static func appIcon(pixels: Int) -> CGImage? {
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: pixels, height: pixels, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        // Everything below is in the 1024pt design space. Shadow offsets and
+        // blurs ignore the CTM, so those scale by k explicitly.
+        let k = CGFloat(pixels) / 1024
+        ctx.scaleBy(x: k, y: k)
+
+        let ds = DS(.dark)
+        let base = NSColor(ds.panelTint).withAlphaComponent(1)
+        let amber = NSColor(ds.attention)
+        func mix(_ color: NSColor, _ other: NSColor, _ fraction: CGFloat) -> CGColor {
+            guard let a = color.usingColorSpace(.sRGB), let b = other.usingColorSpace(.sRGB),
+                  let mixed = a.blended(withFraction: fraction, of: b) else { return color.cgColor }
+            return mixed.cgColor
+        }
+        func white(_ alpha: CGFloat) -> CGColor { NSColor(white: 1, alpha: alpha).cgColor }
+        func gradient(_ colors: [CGColor], _ locations: [CGFloat]) -> CGGradient? {
+            CGGradient(colorsSpace: space, colors: colors as CFArray, locations: locations)
+        }
+
+        let body = CGRect(x: 100, y: 100, width: 824, height: 824)
+        let shape = RoundedRectangle(cornerRadius: 185.4, style: .continuous).path(in: body).cgPath
+        let top = CGPoint(x: body.midX, y: body.maxY), bottom = CGPoint(x: body.midX, y: body.minY)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -10 * k), blur: 24 * k,
+                      color: NSColor.black.withAlphaComponent(0.45).cgColor)
+        ctx.addPath(shape)
+        ctx.setFillColor(base.cgColor)
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        // Body: the panel color lit from above, a soft glow at the top, and a
+        // thin rim that catches the light along the top edge.
+        ctx.saveGState()
+        ctx.addPath(shape)
+        ctx.clip()
+        if let fill = gradient([mix(base, .white, 0.12), base.cgColor, mix(base, .black, 0.4)], [0, 0.55, 1]) {
+            ctx.drawLinearGradient(fill, start: top, end: bottom, options: [])
+        }
+        if let glow = gradient([white(0.10), white(0)], [0, 1]) {
+            let center = CGPoint(x: body.midX, y: 930)
+            ctx.drawRadialGradient(glow, startCenter: center, startRadius: 0,
+                                   endCenter: center, endRadius: 620, options: [])
+        }
+        ctx.addPath(shape)
+        ctx.setLineWidth(6) // half of it falls inside the clip: a 3pt rim
+        ctx.replacePathWithStrokedPath()
+        ctx.clip()
+        if let rim = gradient([white(0.28), white(0.04), white(0.02)], [0, 0.5, 1]) {
+            ctx.drawLinearGradient(rim, start: top, end: bottom, options: [])
+        }
+        ctx.restoreGState()
+
+        // Glyph, drawn larger at the tiny sizes so its strokes survive, and
+        // nudged left/up so glyph + dot read as centered.
+        let side: CGFloat = pixels <= 32 ? 600 : 500
+        let glyph = NSRect(x: 512 - side * 0.522, y: 512 - side * 0.488, width: side, height: side)
+        let s = side / 16 // the glyph's 16-unit grid
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -10 * k), blur: 22 * k,
+                      color: NSColor.black.withAlphaComponent(0.5).cgColor)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        StatusItemController.drawPRGlyph(in: glyph, color: .white)
+        // Shade the strokes white → light gray, top to bottom.
+        ctx.setBlendMode(.sourceAtop)
+        if let shade = gradient([white(1), mix(.white, base, 0.15)], [0, 1]) {
+            ctx.drawLinearGradient(shade, start: CGPoint(x: glyph.midX, y: glyph.maxY),
+                                   end: CGPoint(x: glyph.midX, y: glyph.minY), options: [])
+        }
+        ctx.setBlendMode(.normal)
+        // Amber dot off the glyph's top-right, where the menu bar draws it.
+        let dot = CGRect(x: glyph.minX + (13.9 - 1.55) * s, y: glyph.minY + (16 - 2.3 - 1.55) * s,
+                         width: 3.1 * s, height: 3.1 * s)
+        ctx.saveGState()
+        ctx.addEllipse(in: dot)
+        ctx.clip()
+        if let fill = gradient([mix(amber, .white, 0.2), amber.cgColor, mix(amber, .black, 0.08)], [0, 0.5, 1]) {
+            ctx.drawLinearGradient(fill, start: CGPoint(x: dot.midX, y: dot.maxY),
+                                   end: CGPoint(x: dot.midX, y: dot.minY), options: [])
+        }
+        ctx.restoreGState()
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
+        NSGraphicsContext.restoreGraphicsState()
+
+        return ctx.makeImage()
     }
 }

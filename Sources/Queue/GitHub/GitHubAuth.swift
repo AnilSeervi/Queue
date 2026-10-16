@@ -20,8 +20,19 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
         self.client = GitHubClient(session: session)
     }
 
-    /// OAuth app client id: QUEUE_GITHUB_CLIENT_ID env var, or the
-    /// "githubClientID" user default. Required for the device flow.
+    /// UserDefaults "authMethod": how the user last signed in, "pat" or
+    /// "device". Kept across sign-out so an expired session can reopen the
+    /// right sign-in path.
+    static let authMethodKey = "authMethod"
+
+    /// Queue's own OAuth app (Device Flow enabled). A client ID is a public
+    /// identifier, and the device flow — including token refresh — needs no
+    /// client secret, so shipping it in the binary is safe.
+    static let builtInClientID = "Ov23lictNX7V30UVHJAn"
+
+    /// OAuth app client id for the device flow: the QUEUE_GITHUB_CLIENT_ID
+    /// env var or the "githubClientID" user default override Queue's own app
+    /// (for testing against a different OAuth app).
     static func clientID() throws -> String {
         if let id = ProcessInfo.processInfo.environment["QUEUE_GITHUB_CLIENT_ID"], !id.isEmpty {
             return id
@@ -29,8 +40,12 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
         if let id = UserDefaults.standard.string(forKey: "githubClientID"), !id.isEmpty {
             return id
         }
-        throw GitHubError.missingClientID
+        return builtInClientID
     }
+
+    /// Always true with the built-in client ID; stays a check so an empty
+    /// override can't strand the sign-in card on the device flow.
+    var supportsDeviceFlow: Bool { (try? Self.clientID()).map { !$0.isEmpty } ?? false }
 
     /// Clears the Keychain token and the cached login (AuthProvider.signOut,
     /// called from AppState.signOut()).
@@ -49,6 +64,11 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
     func signIn(withToken token: String) async throws -> String {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw GitHubError.api("Paste a token first.") }
+        // Fine-grained tokens pass GET /user, then silently lose
+        // notifications, check runs and every org but one.
+        guard !trimmed.hasPrefix("github_pat_") else {
+            throw GitHubError.api("Queue needs a classic token — fine-grained tokens can't read notifications or check runs and only cover one org.")
+        }
         Keychain.delete(account: Keychain.refreshTokenAccount)
         guard Keychain.save(trimmed) else {
             throw GitHubError.api("Could not store the token in the Keychain.")
@@ -56,6 +76,7 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
         do {
             let login = try await fetchLogin()
             UserDefaults.standard.set(login, forKey: "githubLogin")
+            UserDefaults.standard.set("pat", forKey: Self.authMethodKey)
             return login
         } catch {
             Keychain.delete()
@@ -73,8 +94,8 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
             // Classic-OAuth scopes: approve/merge need the full "repo" scope —
             // the spec's "repo:status + review write" has no classic-OAuth
             // equivalent (repo:status is read/write commit statuses only, and
-            // there is no standalone review-write scope). read:org lists the
-            // org's repos for onboarding/settings.
+            // there is no standalone review-write scope). read:org resolves
+            // team names among your PRs' requested reviewers.
             params: ["client_id": clientID, "scope": "repo read:org"]
         )
         guard
@@ -122,8 +143,16 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
                 if let refresh = payload["refresh_token"] as? String, !refresh.isEmpty {
                     Keychain.save(refresh, account: Keychain.refreshTokenAccount)
                 }
-                let login = try await fetchLogin()
+                let login: String
+                do {
+                    login = try await fetchLogin()
+                } catch {
+                    Keychain.delete()
+                    Keychain.delete(account: Keychain.refreshTokenAccount)
+                    throw error
+                }
                 UserDefaults.standard.set(login, forKey: "githubLogin")
+                UserDefaults.standard.set("device", forKey: Self.authMethodKey)
                 return login
             }
 
@@ -144,135 +173,23 @@ final class GitHubAuth: AuthProvider, @unchecked Sendable {
         }
     }
 
-    /// Repos available to watch, with open-PR counts (onboarding step 2 and
-    /// Settings). Empty organization = the signed-in user's own repositories.
-    /// One GraphQL query; REST fallback when GraphQL is unavailable.
-    func fetchWatchableRepos() async throws -> [WatchableRepo] {
-        let org = await MainActor.run { settings.organization }
-            .trimmingCharacters(in: .whitespaces)
-        do {
-            return org.isEmpty
-                ? try await fetchViewerReposGraphQL()
-                : try await fetchWatchableReposGraphQL(org: org)
-        } catch let error as GitHubError where error.isAuthError {
-            throw error
-        } catch {
-            return try await fetchWatchableReposREST(org: org)
-        }
-    }
-
     // MARK: - Internals
 
+    /// GET /user with the stored token. A classic token without `repo`
+    /// signs in fine but silently hides every private repo and can't approve
+    /// or merge, so it's refused here (X-OAuth-Scopes lists what it has;
+    /// fine-grained and app tokens send no such header).
     private func fetchLogin() async throws -> String {
         struct User: Decodable { var login: String }
-        let user: User = try await client.get("user")
-        return user.login
-    }
-
-    private func fetchWatchableReposGraphQL(org: String) async throws -> [WatchableRepo] {
-        let query = """
-        query($org: String!) {
-          organization(login: $org) {
-            repositories(first: 20, orderBy: {field: PUSHED_AT, direction: DESC}) {
-              nodes {
-                name
-                owner { login }
-                pullRequests(states: OPEN) { totalCount }
-              }
+        let (data, response) = try await client.restResponse(path: "user")
+        if let header = response?.value(forHTTPHeaderField: "X-OAuth-Scopes") {
+            let scopes = GitHubClient.scopeList(header)
+            guard scopes.contains("repo") else {
+                Keychain.delete()
+                throw GitHubError.api("That token is missing the repo scope, which Queue needs to see private repos and to approve and merge. Create a classic token with repo and read:org checked.")
             }
-          }
         }
-        """
-        let data = try await client.graphql(query: query, variables: ["org": org])
-        guard
-            let organization = data["organization"] as? [String: Any],
-            let repositories = organization["repositories"] as? [String: Any],
-            let nodes = repositories["nodes"] as? [[String: Any]]
-        else {
-            throw GitHubError.api("Organization \"\(org)\" not found or not accessible.")
-        }
-        return Self.mapRepoNodes(nodes)
-    }
-
-    /// The signed-in user's own repos (owner / collaborator / org member).
-    private func fetchViewerReposGraphQL() async throws -> [WatchableRepo] {
-        let query = """
-        query {
-          viewer {
-            repositories(
-              first: 20,
-              orderBy: {field: PUSHED_AT, direction: DESC},
-              affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
-            ) {
-              nodes {
-                name
-                owner { login }
-                pullRequests(states: OPEN) { totalCount }
-              }
-            }
-          }
-        }
-        """
-        let data = try await client.graphql(query: query, variables: [:])
-        guard
-            let viewer = data["viewer"] as? [String: Any],
-            let repositories = viewer["repositories"] as? [String: Any],
-            let nodes = repositories["nodes"] as? [[String: Any]]
-        else {
-            throw GitHubError.api("Could not list your repositories.")
-        }
-        return Self.mapRepoNodes(nodes)
-    }
-
-    private static func mapRepoNodes(_ nodes: [[String: Any]]) -> [WatchableRepo] {
-        nodes.compactMap { node in
-            guard
-                let name = node["name"] as? String,
-                let owner = (node["owner"] as? [String: Any])?["login"] as? String
-            else { return nil }
-            let open = ((node["pullRequests"] as? [String: Any])?["totalCount"] as? Int) ?? 0
-            return WatchableRepo(repo: RepoRef(owner: owner, name: name), openPRs: open)
-        }
-    }
-
-    private func fetchWatchableReposREST(org: String) async throws -> [WatchableRepo] {
-        struct Repo: Decodable {
-            struct Owner: Decodable { var login: String }
-            var name: String
-            var owner: Owner
-        }
-        // Empty org → the user's own repos.
-        let path = org.isEmpty ? "user/repos" : "orgs/\(org)/repos"
-        var queryItems = [URLQueryItem(name: "sort", value: "pushed"),
-                          URLQueryItem(name: "per_page", value: "20")]
-        if org.isEmpty {
-            queryItems.append(URLQueryItem(name: "affiliation", value: "owner,collaborator,organization_member"))
-        }
-        let repos: [Repo] = try await client.get(path, query: queryItems)
-        struct SearchCount: Decodable { var totalCount: Int }
-        // Open-PR counts via search, best-effort (0 on failure).
-        return await withTaskGroup(of: (Int, WatchableRepo).self) { group in
-            for (index, repo) in repos.enumerated() {
-                group.addTask { [client] in
-                    let ref = RepoRef(owner: repo.owner.login, name: repo.name)
-                    let count: Int
-                    do {
-                        let result: SearchCount = try await client.get(
-                            "search/issues",
-                            query: [URLQueryItem(name: "q", value: "is:open is:pr repo:\(ref.fullName)"),
-                                    URLQueryItem(name: "per_page", value: "1")]
-                        )
-                        count = result.totalCount
-                    } catch {
-                        count = 0
-                    }
-                    return (index, WatchableRepo(repo: ref, openPRs: count))
-                }
-            }
-            var ordered: [(Int, WatchableRepo)] = []
-            for await entry in group { ordered.append(entry) }
-            return ordered.sorted { $0.0 < $1.0 }.map { $0.1 }
-        }
+        return try GitHubClient.decoder.decode(User.self, from: data).login
     }
 
     /// Form-encoded POST to a github.com OAuth endpoint (unauthenticated),

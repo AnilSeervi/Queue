@@ -2,13 +2,16 @@ import AppKit
 import SwiftUI
 
 /// Borderless, non-activating panel that behaves like a popover anchored to
-/// the status item: closes when it loses key status or on Esc.
+/// the status item: closes when it loses key status, on Esc or ⌘W, and on a
+/// click outside the app.
 final class FloatingPanel: NSPanel {
     var onClose: (() -> Void)?
 
     /// The status item button the panel is anchored under.
     private weak var anchorButton: NSStatusBarButton?
     private var resizeObserver: NSObjectProtocol?
+    /// Installed only while the panel is open.
+    private var outsideClickMonitor: Any?
 
     init(rootView: some View) {
         super.init(
@@ -57,10 +60,25 @@ final class FloatingPanel: NSPanel {
         close()
     }
 
+    /// ⌘W (main menu Close). A borderless window has no close button, so
+    /// NSWindow would refuse it.
+    override func performClose(_ sender: Any?) {
+        close()
+    }
+
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(performClose(_:)) { return true }
+        return super.validateMenuItem(menuItem)
+    }
+
     override func close() {
         if let resizeObserver {
             NotificationCenter.default.removeObserver(resizeObserver)
             self.resizeObserver = nil
+        }
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
         }
         super.close()
         onClose?()
@@ -81,6 +99,24 @@ final class FloatingPanel: NSPanel {
         }
         repositionUnderAnchor()
         makeKeyAndOrderFront(nil)
+        watchForOutsideClicks()
+    }
+
+    /// resignKey covers most outside clicks, but clicks that don't move key
+    /// focus (the menu bar, another menu bar item, the Dock) leave a
+    /// non-activating panel up. A global monitor sees only other apps'
+    /// events, so clicks inside Queue (the status item, Settings) don't count.
+    private func watchForOutsideClicks() {
+        guard outsideClickMonitor == nil else { return }
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            // Global monitor handlers run on the main thread.
+            MainActor.assumeIsolated {
+                guard let self, self.isVisible else { return }
+                self.close()
+            }
+        }
     }
 
     /// Recompute the origin from the anchor button and the CURRENT size;

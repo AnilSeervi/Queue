@@ -73,23 +73,3 @@ struct PulsingDot: View {
             }
     }
 }
-
-/// Snooze icon: clock with small "z" lines at top-right (tab bar snooze-all).
-struct SnoozeClockIcon: View {
-    var color: Color
-    var size: CGFloat = 14
-
-    var body: some View {
-        ZStack(alignment: .bottomLeading) {
-            Image(systemName: "clock")
-                .font(.system(size: size * 0.8, weight: .medium))
-                .foregroundStyle(color)
-            VStack(alignment: .trailing, spacing: 1.5) {
-                Capsule().fill(color).frame(width: size * 0.28, height: 1.4)
-                Capsule().fill(color).frame(width: size * 0.2, height: 1.4)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-        }
-        .frame(width: size, height: size)
-    }
-}

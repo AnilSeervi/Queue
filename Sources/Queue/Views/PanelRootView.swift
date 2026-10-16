@@ -19,7 +19,9 @@ struct VisualEffectBackground: NSViewRepresentable {
 }
 
 /// Root of the status-item panel. Signed in → tab bar + content + footer;
-/// otherwise onboarding cards (spec 1e).
+/// otherwise onboarding cards (spec 1e). An SSO notice, when GitHub sends
+/// one, takes a line at the bottom of the content area — it affects every
+/// tab — so the panel keeps its size.
 struct PanelRootView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) private var scheme
@@ -30,8 +32,14 @@ struct PanelRootView: View {
             if case .signedIn = state.auth {
                 VStack(spacing: 0) {
                     TabBarView()
-                    content
-                        .frame(width: DSMetric.panelWidth, height: DSMetric.contentHeight)
+                    VStack(spacing: 0) {
+                        content
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        if let notice = state.ssoNotice {
+                            SSONoticeLine(notice: notice) { state.open($0) }
+                        }
+                    }
+                    .frame(width: DSMetric.panelWidth, height: DSMetric.contentHeight)
                     FooterView()
                 }
                 .frame(width: DSMetric.panelWidth)
