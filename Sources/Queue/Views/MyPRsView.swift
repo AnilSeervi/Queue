@@ -4,11 +4,12 @@ import SwiftUI
 // "My PRs" tab (spec 1a): the user's open PRs grouped by repo. Leading CI
 // status icon (check / X / pulsing amber dot / dash for no checks / faint dot
 // when unknown), title + "#n · branch" meta, trailing status pill. The X opens
-// the failing check. Hover reveals Merge (when ready; click twice) / Re-run
-// (when failing Actions runs can be re-run) / "⌥ Copy branch" (always) /
-// open. Rows arrive in MyPR.sortRank order within each repo and keep it
-// here, so an optimistic change doesn't move a row under the pointer. At the
-// end, "Done · N" opens your PRs merged this week (DoneSection).
+// the failing check. Hover reveals icons: Merge (when ready; click twice) /
+// Re-run (when failing Actions runs can be re-run) / Copy branch / Open in
+// editor (on a worktree) / open. Rows arrive in MyPR.sortRank order within
+// each repo and keep it here, so an optimistic change doesn't move a row
+// under the pointer. At the end, "Done · N" opens your PRs merged this week
+// (DoneSection).
 
 struct MyPRsView: View {
     @EnvironmentObject var state: AppState
@@ -59,14 +60,13 @@ private struct MyPRRowView: View {
     @EnvironmentObject var state: AppState
     var pr: MyPR
 
-    @State private var copied = false
-    @State private var copyGeneration = 0
-    /// Two-step Merge (owner decision D2): the first click turns the button
+    /// Two-step Merge (owner decision D2): the first click widens the icon
     /// into "Squash & merge?" for `confirmWindow`; a second click merges.
     @State private var confirmingMerge = false
     @State private var confirmGeneration = 0
     @State private var confirmShownAt = Date.distantPast
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.rowPreview) private var preview
 
     private static let confirmWindow: UInt64 = 3_000_000_000
     /// A double-click's second half lands sooner than this; it doesn't count
@@ -78,11 +78,32 @@ private struct MyPRRowView: View {
         QueueRow(
             title: pr.title,
             meta: pr.meta,
+            pinned: pinned,
             onOpen: { state.open(pr.url) },
             leading: { statusIcon(ds) },
             trailing: { StatusPillView(text: pr.pillText, kind: pr.pillKind) },
             actions: { actionCluster(ds) }
         )
+        // A pinned row keeps its cluster when the pointer leaves; a pending
+        // confirmation still goes.
+        .onHover { inside in
+            if !inside { cancelMergeConfirmation() }
+        }
+    }
+
+    /// The actions stay up while the branch opens in the editor (and in
+    /// the Snapshotter's hovered rows).
+    private var pinned: Bool {
+        if preview.hovered.contains(pr.id) || preview.confirmingMerge.contains(pr.id) { return true }
+        guard let ref = pr.branchRef else { return false }
+        return state.editorStep(for: ref) != nil || preview.busy.contains(AppState.editorKey(ref))
+    }
+
+    /// The branch to copy: the head branch, else the meta line's name
+    /// ("—" when GitHub didn't say).
+    private var copyableBranch: String? {
+        if let ref = pr.branchRef { return ref.branch }
+        return pr.branch.isEmpty || pr.branch == "—" ? nil : pr.branch
     }
 
     /// ✓ success / ✕ danger (opens the failing check) / 9px pulsing attention
@@ -116,13 +137,15 @@ private struct MyPRRowView: View {
 
     @ViewBuilder private func actionCluster(_ ds: DS) -> some View {
         if pr.canMerge, let method = pr.mergeMethod {
-            TextActionButton(
-                label: confirmingMerge ? method.confirmLabel : "Merge",
-                color: ds.merge,
-                background: ds.merge.opacity(confirmingMerge ? 0.28 : 0.14),
-                help: confirmingMerge
+            let confirming = confirmingMerge || preview.confirmingMerge.contains(pr.id)
+            IconActionButton(
+                systemName: "arrow.triangle.merge",
+                help: confirming
                     ? "Click again to merge #\(pr.number) (\(Self.describe(method).lowercased()))"
                     : "\(Self.describe(method)) — click, then confirm",
+                accessibilityName: confirming ? "Confirm: \(Self.describe(method).lowercased())" : "Merge",
+                tint: ds.merge,
+                label: confirming ? method.confirmLabel : nil,
                 action: { mergeTapped() }
             )
             // The cluster goes away when the pointer leaves the row; so does
@@ -130,30 +153,24 @@ private struct MyPRRowView: View {
             .onDisappear(perform: cancelMergeConfirmation)
         }
         if pr.canRerun {
-            TextActionButton(
-                label: "Re-run",
-                color: ds.attention,
-                background: ds.attention.opacity(0.14),
+            IconActionButton(
+                systemName: "arrow.clockwise",
                 help: pr.failedRunIDs.count == 1
                     ? "Re-run the failed jobs"
-                    : "Re-run the failed jobs in \(pr.failedRunIDs.count) workflow runs"
+                    : "Re-run the failed jobs in \(pr.failedRunIDs.count) workflow runs",
+                accessibilityName: "Re-run failed checks",
+                tint: ds.attention
             ) {
                 withAnimation(.easeOut(duration: 0.15)) { state.rerunChecks(pr) }
             }
         }
-        // Spec: "⌥ Copy branch … always" — an unconditional cluster member
-        // ("⌥" is literal label text), white 0.65 on white 0.10 dark / black
-        // equivalents light — not covered by Theme.
-        TextActionButton(
-            label: copied ? "Copied" : "⌥ Copy branch",
-            color: ds.dark ? Color.white.opacity(0.65) : Color.black.opacity(0.65),
-            background: ds.dark ? Color.white.opacity(0.10) : Color.black.opacity(0.10),
-            help: "Copy \(pr.branch)",
-            action: copyBranch
-        )
-        IconActionButton(systemName: "arrow.up.right", help: "Open on GitHub") {
-            state.open(pr.url)
+        if let branch = copyableBranch {
+            CopyBranchButton(branch: branch)
         }
+        if let ref = pr.branchRef {
+            OpenInEditorButton(ref: ref)
+        }
+        OpenOnGitHubButton { state.open(pr.url) }
     }
 
     private static func describe(_ method: MergeMethod) -> String {
@@ -186,18 +203,6 @@ private struct MyPRRowView: View {
         guard confirmingMerge else { return }
         confirmGeneration += 1
         confirmingMerge = false
-    }
-
-    private func copyBranch() {
-        state.copyBranch(pr)
-        copyGeneration += 1
-        let generation = copyGeneration
-        withAnimation(.easeOut(duration: 0.12)) { copied = true }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            guard generation == copyGeneration else { return }
-            withAnimation(.easeOut(duration: 0.12)) { copied = false }
-        }
     }
 }
 

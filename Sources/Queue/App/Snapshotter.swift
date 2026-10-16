@@ -42,6 +42,12 @@ enum Snapshotter {
                          dark: dark, to: url.appendingPathComponent("panel-\(tab.rawValue)-done-\(suffix).png"))
                 }
                 state.expandedDone = []
+                // Hover actions, as if the pointer were on the rows.
+                for (name, tab, preview) in hoverPreviews {
+                    state.activeTab = tab
+                    snap(PanelRootView().environmentObject(state).environment(\.rowPreview, preview),
+                         dark: dark, to: url.appendingPathComponent("panel-\(name)-\(suffix).png"))
+                }
                 snap(SettingsView(state: state).environmentObject(state), dark: dark,
                      to: url.appendingPathComponent("settings-\(suffix).png"))
             }
@@ -69,6 +75,21 @@ enum Snapshotter {
             NSApp.terminate(nil)
         }
         return true
+    }
+
+    /// Inbox: a review request's icons and a mention's, with the fork PR's
+    /// branch opening in the editor. My PRs: a failing PR's icons (Re-run)
+    /// and a ready one's (Merge), then that Merge asking to confirm.
+    private static var hoverPreviews: [(name: String, tab: PanelTab, preview: RowPreview)] {
+        var opening: Set<String> = []
+        for case .review(let request) in MockData.inbox where request.branchRef?.isFromFork == true {
+            if let ref = request.branchRef { opening.insert(AppState.editorKey(ref)) }
+        }
+        return [
+            ("inbox-hover", .inbox, RowPreview(hovered: ["rr-4821", "m-4790"], busy: opening)),
+            ("prs-hover", .prs, RowPreview(hovered: ["pr-391", "pr-2215"])),
+            ("prs-merge", .prs, RowPreview(confirmingMerge: ["pr-2215"])),
+        ]
     }
 
     private static func snap(_ view: some View, dark: Bool, to fileURL: URL) {

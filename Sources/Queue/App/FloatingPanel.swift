@@ -26,6 +26,10 @@ final class FloatingPanel: NSPanel {
         backgroundColor = .clear
         isOpaque = false
         hasShadow = true
+        // The panel never activates Queue on its own; without this, AppKit
+        // skips tooltips for an inactive app — and the row actions are
+        // icon-only, so their tooltips are their labels.
+        allowsToolTipsWhenApplicationIsInactive = true
         hidesOnDeactivate = false
         isMovableByWindowBackground = false
         animationBehavior = .utilityWindow

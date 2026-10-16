@@ -192,6 +192,36 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         return runs.count - refusals.count
     }
 
+    /// Each PR's state by node id, one nodes(ids:) query per
+    /// QueueGraphQL.lifecycleBatch. Ids GitHub can't resolve (deleted, no
+    /// longer visible, SSO-hidden, not a PR) are omitted. Any failed batch
+    /// throws: cleanup just waits for the next round.
+    func prLifecycles(_ nodeIDs: [String]) async throws -> [String: PRLifecycle] {
+        var seen = Set<String>()
+        let ids = nodeIDs.filter { !$0.isEmpty && seen.insert($0).inserted }
+        var states: [String: PRLifecycle] = [:]
+        for start in stride(from: 0, to: ids.count, by: QueueGraphQL.lifecycleBatch) {
+            let batch = Array(ids[start..<min(start + QueueGraphQL.lifecycleBatch, ids.count)])
+            let (data, errors) = try await client.graphql(
+                LifecycleDocument.self,
+                query: QueueGraphQL.lifecycleDocument,
+                variables: ["ids": batch]
+            )
+            Self.logDeepErrors(errors)
+            guard let nodes = data.nodes else {
+                throw GitHubError.api(errors.first?.message ?? "GitHub returned no data.")
+            }
+            // Index-aligned with the ids.
+            for (id, node) in zip(batch, nodes) {
+                guard let node = node.value, node.id == id,
+                      let state = node.state.flatMap({ PRLifecycle(rawValue: $0.lowercased()) })
+                else { continue }
+                states[id] = state
+            }
+        }
+        return states
+    }
+
     /// What became of review requests that left the inbox, looked up by
     /// `nodeID` (requests without one are omitted), one nodes(ids:) query
     /// per QueueGraphQL.resolveBatch. Pass each request as last seen: its
@@ -450,9 +480,40 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
                 url: node.url.flatMap(URL.init(string:)) ?? repo.url,
                 headSHA: node.headSHA,
                 nodeID: node.id,
-                updatedAt: node.updatedAt
+                updatedAt: node.updatedAt,
+                branchRef: branchRef(
+                    repo: repo, number: number, branch: node.branch, crossRepo: node.isCrossRepository,
+                    headRepo: node.headRepo, nodeID: node.id, isMine: false
+                )
             )
         }
+    }
+
+    /// Where the PR's head branch lives. nil when the name is missing, or
+    /// when it's in a fork GitHub no longer shows (deleted, unreadable): the
+    /// name alone would find the base repo's branch of that name, often
+    /// another "main" or "patch-1" altogether.
+    private static func branchRef(
+        repo: RepoRef,
+        number: Int,
+        branch: String?,
+        crossRepo: Bool?,
+        headRepo: RepoPayload?,
+        nodeID: String?,
+        isMine: Bool
+    ) -> BranchRef? {
+        guard let branch, !branch.isEmpty else { return nil }
+        let head = headRepo?.fullName.flatMap(parseRepo)
+        // Without a head repo, only GitHub's word makes it a same-repo PR.
+        if head == nil, crossRepo != false { return nil }
+        return BranchRef(
+            repo: repo,
+            number: number,
+            branch: branch,
+            headRepo: head == repo ? nil : head,
+            prNodeID: nodeID,
+            isMine: isMine
+        )
     }
 
     // MARK: - Inbox: mentions
@@ -727,7 +788,11 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
             updatedAt: node.updatedAt,
             // Unknown role (field missing) keeps the actions available.
             canWrite: node.repo?.permission.map { ["ADMIN", "MAINTAIN", "WRITE"].contains($0) } ?? true,
-            reviewStateKnown: !reviewsUnreadable
+            reviewStateKnown: !reviewsUnreadable,
+            branchRef: branchRef(
+                repo: repo, number: number, branch: node.branch, crossRepo: node.isCrossRepository,
+                headRepo: node.headRepo, nodeID: node.id, isMine: true
+            )
         )
         return (pr, checks)
     }

@@ -38,6 +38,31 @@ struct Age: Hashable {
     var isStale: Bool { -date.timeIntervalSinceNow >= 3 * 24 * 3600 }
 }
 
+// MARK: - Branches (copy / open in editor on a worktree)
+
+/// Everything needed to check a PR's branch out locally.
+struct BranchRef: Hashable, Codable {
+    /// The repo the PR is in (its base).
+    var repo: RepoRef
+    var number: Int
+    /// The PR's head branch name (headRefName).
+    var branch: String
+    /// The repo the branch lives in when it differs from `repo` (a fork);
+    /// nil for same-repo PRs.
+    var headRepo: RepoRef?
+    /// GraphQL node id of the PR (cleanup looks up its state).
+    var prNodeID: String?
+    /// Your own PR: check it out as a tracking branch you can push.
+    var isMine: Bool
+
+    var isFromFork: Bool { headRepo != nil && headRepo != repo }
+}
+
+/// Open/closed state of a PR, for worktree cleanup.
+enum PRLifecycle: String, Hashable, Codable {
+    case open, merged, closed
+}
+
 // MARK: - Inbox
 
 struct UserRef: Hashable, Codable {
@@ -73,6 +98,8 @@ struct ReviewRequest: Identifiable, Hashable {
     var nodeID: String? = nil
     /// Last activity on the PR (used to expire the session's approved filter).
     var updatedAt: Date? = nil
+    /// The PR's head branch (Copy branch / open in editor); nil if unknown.
+    var branchRef: BranchRef? = nil
 
     var meta: String { "#\(number) · \(author.login) · +\(additions) −\(deletions)" }
 }
@@ -247,6 +274,9 @@ struct MyPR: Identifiable, Hashable {
     /// False when GitHub errored on this PR's reviews this refresh, so
     /// approvals / changes requested are not trustworthy.
     var reviewStateKnown = true
+    /// Head branch details for open-in-editor (fork PRs to repos you
+    /// contribute to included); nil if unknown.
+    var branchRef: BranchRef? = nil
 
     var meta: String { "#\(number) · \(branch)" }
 

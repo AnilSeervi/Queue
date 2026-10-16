@@ -19,10 +19,11 @@ final class SettingsWindowController {
     /// launch; HotKey returns nil when another app holds the combination).
     var globalShortcut: (combo: KeyCombo, registered: Bool) = (.togglePanel, true)
 
-    /// Spec 1d: 500pt content width; height fits content (~560–620), scrolls if taller.
+    /// Spec 1d: 500pt content width; height fits content (~645 with the
+    /// Branches group), scrolls if taller.
     private static let contentWidth: CGFloat = 500
-    private static let maxContentHeight: CGFloat = 640
-    private static let fallbackContentHeight: CGFloat = 590
+    private static let maxContentHeight: CGFloat = 700
+    private static let fallbackContentHeight: CGFloat = 645
 
     func show(state: AppState) {
         if window == nil {
@@ -178,6 +179,11 @@ struct SettingsContentView: View {
                 badgeRow
                 hairline
                 toggleRow("Red dot when CI fails on your PR", isOn: $settings.alertOnCIFail)
+            }
+            group("BRANCHES") {
+                codeFolderRow
+                hairline
+                editorRow
             }
         }
         .padding(EdgeInsets(top: 16, leading: 18, bottom: 16, trailing: 18))
@@ -361,6 +367,83 @@ struct SettingsContentView: View {
             BadgeSegmentedControl(selection: $settings.badgeStyle)
         }
         .padding(rowPadding)
+    }
+
+    // MARK: Branch rows (open in editor)
+
+    /// Where your clones are. Unset until the first open-in-editor asks (or
+    /// Choose… here); a folder that's gone shows in red.
+    private var codeFolderRow: some View {
+        HStack(spacing: 8) {
+            rowLabel("Code folder")
+            Spacer(minLength: 8)
+            if let folder = settings.codeFolder {
+                let missing = !WorkspacePath.isDirectory(folder)
+                Text(WorkspaceError.abbreviated(folder))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(missing ? ds.danger : ds.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(missing ? "\(folder) isn't there — choose your code folder again." : folder)
+            } else {
+                Text("Asked the first time you open a branch")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(pal.caption)
+                    .lineLimit(1)
+            }
+            Button("Choose…") {
+                // The button's window is key while it's clicked.
+                let window = NSApp.keyWindow
+                Task { await state.chooseCodeFolder(attachedTo: window) }
+            }
+            .controlSize(.small)
+        }
+        .padding(rowPadding)
+        .help("The folder your clones are in. Queue opens a PR's branch on a worktree beside its clone "
+              + "(<repo>.worktrees/<branch>) and clones repos you don't have into this folder, with your own git sign-in.")
+    }
+
+    /// The editors Queue found installed; nil in the setting means the
+    /// first of them, which is what the picker shows then.
+    private var editorRow: some View {
+        let editors = EditorCatalog.installed()
+        return HStack(spacing: 8) {
+            rowLabel("Open branches in")
+            Spacer(minLength: 8)
+            if let first = editors.first {
+                Picker("", selection: Binding(
+                    get: { EditorCatalog.preferred(settings.editorBundleID)?.bundleID ?? first.bundleID },
+                    set: { settings.editorBundleID = $0 }
+                )) {
+                    ForEach(editors) { editor in
+                        Label {
+                            Text(editor.name)
+                        } icon: {
+                            Image(nsImage: Self.menuIcon(for: editor))
+                        }
+                        .tag(editor.bundleID)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
+            } else {
+                Text("No supported editor installed")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(ds.danger)
+                    .help("Queue opens branches in VS Code, Cursor, Windsurf, Zed, Sublime Text, Nova, BBEdit, "
+                          + "TextMate, JetBrains IDEs or Xcode.")
+            }
+        }
+        .padding(rowPadding)
+    }
+
+    /// The editor's app icon at menu size.
+    private static func menuIcon(for editor: InstalledEditor) -> NSImage {
+        let icon = EditorCatalog.icon(for: editor).copy() as? NSImage ?? NSImage()
+        icon.size = NSSize(width: 16, height: 16)
+        return icon
     }
 
     // MARK: Notification rows

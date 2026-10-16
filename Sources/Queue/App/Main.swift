@@ -65,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         state.openSettingsWindow = { [weak self] in self?.openSettings() }
         state.closePanel = { [weak self] in self?.closePanel() }
+        state.showPanel = { [weak self] in self?.showPanel() }
         Notifier.shared.openPanel = { [weak self] in self?.showPanel() }
         Notifier.shared.onMentionOpened = { [weak state] threadID, updatedAt, done in
             state?.markThreadRead(threadID, updatedAt: updatedAt, done: done)

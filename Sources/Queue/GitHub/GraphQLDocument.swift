@@ -132,6 +132,7 @@ enum QueueGraphQL {
                 headSHA: headRefOid
                 author { login }
                 repo: repository { fullName: nameWithOwner }
+                \(headBranch)
               }
             """
         case .myPRs:
@@ -143,7 +144,7 @@ enum QueueGraphQL {
             return """
             ... on PullRequest {
                 id number title url createdAt updatedAt isDraft reviewDecision
-                branch: headRefName
+                \(headBranch)
                 headSHA: headRefOid
                 mergeState: mergeStateStatus
                 repo: repository {
@@ -212,6 +213,19 @@ enum QueueGraphQL {
         }
     }
 
+    /// Where a PR's head branch lives (Copy branch, open in editor). The head
+    /// repo is null when the fork was deleted or can't be read, which only
+    /// `isCrossRepository` tells apart from a same-repo PR. Scalars and a
+    /// single object, no connection: the documents stay at 1 point. The head
+    /// repo is the only part with a measurable price, each fork's repository
+    /// loading: ~0.5s on a 50-node page of mdn/content's PRs, lost in the
+    /// noise on a 10-node My PRs page.
+    private static let headBranch = """
+    branch: headRefName
+        isCrossRepository
+        headRepo: headRepository { fullName: nameWithOwner }
+    """
+
     /// Your latest submitted reviews on a PR, and its latest dismissals (a
     /// dismissed review reads DISMISSED; the event keeps the verdict it
     /// was). A connection's own `first` or `last` doesn't add cost (its
@@ -254,6 +268,19 @@ enum QueueGraphQL {
           \(yourReviews)
         }
       }
+    }
+    """
+
+    /// Most PRs `lifecycleDocument` looks up at once.
+    static let lifecycleBatch = 50
+
+    /// Open / merged / closed by PR node id, for worktree cleanup: 1 point
+    /// for a full batch. Ids GitHub can't resolve come back as null nodes
+    /// with a NOT_FOUND error; ids of other kinds of node, as `{}`.
+    static let lifecycleDocument = """
+    query QueueLifecycles($ids: [ID!]!) {
+      rateLimit { cost remaining }
+      nodes(ids: $ids) { ... on PullRequest { id state } }
     }
     """
 
@@ -338,6 +365,16 @@ struct ResolveDocument: Decodable {
     var rateLimit: RateLimitPayload?
 }
 
+/// `data` of `QueueGraphQL.lifecycleDocument`.
+struct LifecycleDocument: Decodable {
+    struct PR: Decodable {
+        var id: String?
+        var state: String?          // OPEN | CLOSED | MERGED
+    }
+    var nodes: [Lossy<PR>]?
+    var rateLimit: RateLimitPayload?
+}
+
 struct RateLimitPayload: Decodable {
     var cost: Int?
     var remaining: Int?
@@ -399,6 +436,9 @@ struct ReviewRequestPayload: Decodable {
     var headSHA: String?
     var author: LoginPayload?
     var repo: RepoPayload?
+    var branch: String?
+    var isCrossRepository: Bool?
+    var headRepo: RepoPayload?
 }
 
 struct MyPRPayload: Decodable {
@@ -445,6 +485,10 @@ struct MyPRPayload: Decodable {
     var isDraft: Bool?
     var reviewDecision: String?
     var branch: String?
+    var isCrossRepository: Bool?
+    /// The branch's repo (the fork, for fork PRs); null when the fork was
+    /// deleted or can't be read.
+    var headRepo: RepoPayload?
     var headSHA: String?
     var mergeState: String?
     var repo: RepoPayload?

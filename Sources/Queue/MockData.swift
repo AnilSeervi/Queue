@@ -22,6 +22,15 @@ enum MockData {
         URL(string: "https://github.com/\(repo.fullName)/issues/\(n)")!
     }
 
+    /// Shaped like GitHub's PR node ids, but no real PR has one, so a live
+    /// session's worktrees never match a fixture.
+    static func nodeID(_ n: Int) -> String { String(format: "PR_kwDOdemo%04d", n) }
+
+    /// A teammate's branch; `fork` when it lives in their fork.
+    private static func theirBranch(_ repo: RepoRef, _ n: Int, _ name: String, fork: RepoRef? = nil) -> BranchRef {
+        BranchRef(repo: repo, number: n, branch: name, headRepo: fork, prNodeID: nodeID(n), isMine: false)
+    }
+
     static var inbox: [InboxEntry] {
         [
             .review(ReviewRequest(
@@ -29,13 +38,15 @@ enum MockData {
                 title: "Add SLA breach webhooks to workflow engine",
                 author: UserRef(login: "mvdheijden"), additions: 342, deletions: 18,
                 age: Age(date: ago(hours: 2)), url: prURL(itsmCore, 4821),
-                headSHA: "3f9c2e1a7b", nodeID: "PR_kwDOdemo4821", updatedAt: ago(minutes: 50))),
+                headSHA: "3f9c2e1a7b", nodeID: nodeID(4821), updatedAt: ago(minutes: 50),
+                branchRef: theirBranch(itsmCore, 4821, "feat/sla-breach-webhooks"))),
             .review(ReviewRequest(
                 id: "rr-4809", repo: itsmCore, number: 4809,
                 title: "Refactor incident assignment rules",
                 author: UserRef(login: "tkole"), additions: 96, deletions: 140,
                 age: Age(date: ago(days: 1)), url: prURL(itsmCore, 4809),
-                headSHA: "8d41b07c2e", nodeID: "PR_kwDOdemo4809", updatedAt: ago(hours: 7))),
+                headSHA: "8d41b07c2e", nodeID: nodeID(4809), updatedAt: ago(hours: 7),
+                branchRef: theirBranch(itsmCore, 4809, "tkole/assignment-rules"))),
             .mention(Mention(
                 id: "m-4790", repo: itsmCore, number: 4790,
                 comment: "Went with your suggestion on the retry cap.",
@@ -47,7 +58,8 @@ enum MockData {
                 title: "Migrate request table to virtual scrolling",
                 author: UserRef(login: "asmit"), additions: 510, deletions: 388,
                 age: Age(date: ago(hours: 5)), url: prURL(webClient, 2210),
-                headSHA: "c27e95f310", nodeID: "PR_kwDOdemo2210", updatedAt: ago(hours: 1))),
+                headSHA: "c27e95f310", nodeID: nodeID(2210), updatedAt: ago(hours: 1),
+                branchRef: theirBranch(webClient, 2210, "perf/virtual-scroll-requests"))),
             .mention(Mention(
                 id: "m-2198", repo: webClient, number: 2198,
                 comment: "Can you sanity-check the keyboard nav here?",
@@ -59,7 +71,10 @@ enum MockData {
                 title: "Jira sync: handle custom field mapping",
                 author: UserRef(login: "pdeboer"), additions: 212, deletions: 40,
                 age: Age(date: ago(hours: 1, days: 3)), url: prURL(integrations, 388),
-                headSHA: "5a0d6b8e94", nodeID: "PR_kwDOdemo0388", updatedAt: ago(days: 2))),
+                headSHA: "5a0d6b8e94", nodeID: nodeID(388), updatedAt: ago(days: 2),
+                // Sent from pdeboer's fork.
+                branchRef: theirBranch(integrations, 388, "jira-custom-fields",
+                                       fork: RepoRef(owner: "pdeboer", name: "integrations")))),
             // A thread you were mentioned in earlier; the latest comment
             // doesn't mention you, so it's generic activity (no author).
             .mention(Mention(
@@ -75,6 +90,7 @@ enum MockData {
     /// One PR in each state: changes requested, running, conflicts, ready,
     /// failing (with Actions runs to re-run), draft. Within a repo the rows
     /// are in MyPR.sortRank order, as the live data source returns them.
+    /// Every branch is your own, in the PR's repo.
     static var prs: [MyPR] {
         [
             MyPR(id: "pr-4835", repo: itsmCore, number: 4835,
@@ -119,7 +135,12 @@ enum MockData {
                  age: Age(date: ago(hours: 20)), url: prURL(integrations, 394),
                  isDraft: true, mergeState: .draft,
                  headSHA: "6c5b4a3928", mergeMethod: .merge, updatedAt: ago(hours: 20)),
-        ]
+        ].map { pr in
+            var pr = pr
+            pr.branchRef = BranchRef(repo: pr.repo, number: pr.number, branch: pr.branch,
+                                     prNodeID: nodeID(pr.number), isMine: true)
+            return pr
+        }
     }
 
     static var issues: [AssignedIssue] {
@@ -211,6 +232,24 @@ enum MockData {
         Snapshot(inbox: inbox, prs: prs, issues: issues, stats: stats,
                  doneReviews: doneReviews, mergedPRs: mergedPRs)
     }
+
+    /// Fixture PRs by node id: the listed ones open; of the done ones, those
+    /// merged (yours, and the request merged without you) merged, the rest
+    /// (a withdrawn request, a cleared mention's PR) still open.
+    static var lifecycles: [String: PRLifecycle] {
+        var states: [String: PRLifecycle] = [:]
+        for case .review(let request) in inbox { states[nodeID(request.number)] = .open }
+        for pr in prs { states[nodeID(pr.number)] = .open }
+        for item in mergedPRs + loggedDone {
+            guard let number = item.number else { continue }
+            switch item.outcome {
+            case .merged, .resolvedMerged: states[nodeID(number)] = .merged
+            case .resolvedClosed: states[nodeID(number)] = .closed
+            default: states[nodeID(number)] = .open
+            }
+        }
+        return states
+    }
 }
 
 /// Demo/preview data source: serves the fixture, pretends writes succeed.
@@ -220,6 +259,16 @@ final class MockDataSource: QueueDataSource {
     func merge(_ pr: MyPR) async throws {}
     func rerunChecks(_ pr: MyPR) async throws -> Int { max(1, pr.failedRunIDs.count) }
     func markThreadRead(_ threadID: String) async throws {}
+
+    /// Fixture states (MockData.lifecycles). Any other id, such as a live
+    /// session's worktree PR, is omitted the way GitHub omits ids it can't
+    /// resolve, so demo mode never cleans up a real worktree.
+    func prLifecycles(_ nodeIDs: [String]) async throws -> [String: PRLifecycle] {
+        let known = MockData.lifecycles
+        var states: [String: PRLifecycle] = [:]
+        for id in nodeIDs { states[id] = known[id] }
+        return states
+    }
 
     /// A demo request only leaves the inbox through Approve, so each one
     /// resolves as your approval, just now (the live rule: no nodeID, no

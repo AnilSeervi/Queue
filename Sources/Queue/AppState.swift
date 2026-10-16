@@ -49,6 +49,9 @@ protocol QueueDataSource {
     func rerunChecks(_ pr: MyPR) async throws -> Int
     /// PATCH notifications/threads/{id} (mark read). Best-effort.
     func markThreadRead(_ threadID: String) async throws
+    /// Open / merged / closed for PR node ids (worktree cleanup). Omits ids
+    /// that couldn't be looked up.
+    func prLifecycles(_ nodeIDs: [String]) async throws -> [String: PRLifecycle]
     /// For review requests that vanished from the inbox, what happened:
     /// keyed by ReviewRequest.id → a DoneItem (your review, merged/closed
     /// without you, or request removed). Omits requests still pending or
@@ -93,6 +96,11 @@ final class SettingsStore: ObservableObject {
     @Published var notifyMentions: Bool { didSet { defaults.set(notifyMentions, forKey: "notifyMentions") } }
     @Published var notifyCIFailures: Bool { didSet { defaults.set(notifyCIFailures, forKey: "notifyCIFailures") } }
     @Published var notifyPRReady: Bool { didSet { defaults.set(notifyPRReady, forKey: "notifyPRReady") } }
+    /// Folder holding your clones (e.g. ~/Projects); nil until chosen —
+    /// the first "open in editor" asks for it.
+    @Published var codeFolder: String? { didSet { defaults.set(codeFolder, forKey: "codeFolder") } }
+    /// Bundle id of the editor branches open in; nil = first installed one.
+    @Published var editorBundleID: String? { didSet { defaults.set(editorBundleID, forKey: "editorBundleID") } }
 
     /// Keys of removed features — the repo picker and footer CI strip (Queue
     /// covers all your repos now), hiding items until morning — and of values
@@ -111,6 +119,8 @@ final class SettingsStore: ObservableObject {
         notifyMentions = defaults.object(forKey: "notifyMentions") as? Bool ?? true
         notifyCIFailures = defaults.object(forKey: "notifyCIFailures") as? Bool ?? true
         notifyPRReady = defaults.object(forKey: "notifyPRReady") as? Bool ?? true
+        codeFolder = defaults.string(forKey: "codeFolder")
+        editorBundleID = defaults.string(forKey: "editorBundleID")
 
         for key in Self.retiredKeys where defaults.object(forKey: key) != nil {
             defaults.removeObject(forKey: key)
@@ -198,6 +208,8 @@ final class AppState: ObservableObject {
     var openSettingsWindow: (() -> Void)?
     /// Wired by AppDelegate: closes the panel (used after deep-linking out).
     var closePanel: (() -> Void)?
+    /// Wired by AppDelegate: opens the panel (back from choosing the code folder).
+    var showPanel: (() -> Void)?
 
     var authProvider: AuthProvider?
     /// The in-flight device-flow task, cancelled when switching to token entry.
@@ -242,6 +254,18 @@ final class AppState: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
     private var wakeTask: Task<Void, Never>?
     private var rerunResetTasks: [String: Task<Void, Never>] = [:]
+
+    // Open in editor (a PR's branch on a worktree; see WorktreeManager).
+    /// Branches being opened, by `editorKey`: which job, and the step it's
+    /// on ("Fetching feat/x…") — the row's spinner and its tooltip.
+    @Published private var editorJobs: [String: (job: Int, step: String)] = [:]
+    private var lastEditorJob = 0
+    /// The code folder panel that's up, which a second click waits on.
+    private var codeFolderChoice: Task<String?, Never>?
+    /// Worktree cleanup runs after a refresh, at most this often.
+    static let cleanupInterval: TimeInterval = 10 * 60
+    private var lastCleanupAt: Date?
+    private var cleaningUp = false
 
     static var isDemo: Bool { ProcessInfo.processInfo.environment["QUEUE_DEMO"] == "1" }
 
@@ -500,6 +524,8 @@ final class AppState: ObservableObject {
         } else if !retriedSinceSuccess {
             scheduleRefresh(after: Self.retryDelay, isRetry: true)
         }
+        // The open PRs are known, so the rest can be looked up.
+        if Self.badgeSections.isSubset(of: fresh) { cleanUpWorktrees() }
 
         // Demo fixtures never change, so there's nothing to announce.
         if !Self.isDemo {
@@ -844,9 +870,205 @@ final class AppState: ObservableObject {
         Task { try? await source.markThreadRead(threadID) }
     }
 
-    func copyBranch(_ pr: MyPR) {
+    func copyBranch(_ branch: String) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(pr.branch, forType: .string)
+        NSPasteboard.general.setString(branch, forType: .string)
+    }
+
+    // MARK: Open in editor
+
+    /// One open-in-editor at a time per PR.
+    static func editorKey(_ ref: BranchRef) -> String {
+        "\(ref.repo.fullName.lowercased())#\(ref.number)"
+    }
+
+    /// What opening `ref` in the editor is doing ("Cloning acme/web…"); nil
+    /// when it isn't running.
+    func editorStep(for ref: BranchRef) -> String? {
+        editorJobs[Self.editorKey(ref)]?.step
+    }
+
+    /// Opens the PR's branch in your editor (Settings; else the first one
+    /// installed) on a worktree beside your clone in the code folder, which
+    /// WorktreeManager finds or clones with your own git credentials. The
+    /// first time, asks for the code folder. The row's icon spins until the
+    /// editor opens; a failure shows the reason inline, as does a worktree
+    /// left behind the PR's latest commit.
+    func openInEditor(_ ref: BranchRef) {
+        let key = Self.editorKey(ref)
+        guard editorJobs[key] == nil else { return }
+        clearActionError()
+        guard let editor = EditorCatalog.preferred(settings.editorBundleID) else {
+            reportActionError("Couldn't open #\(ref.number) — \(WorkspaceError.noEditor.localizedDescription)")
+            return
+        }
+        lastEditorJob += 1
+        let job = lastEditorJob
+        editorJobs[key] = (job, WorkspaceStep.findingClone.label)
+        let generation = sessionGeneration
+        Task {
+            defer { if editorJobs[key]?.job == job { editorJobs[key] = nil } }
+            if Self.isDemo {
+                await demoOpenInEditor(ref, key: key, job: job)
+                return
+            }
+            var folder = settings.codeFolder
+            if folder == nil {
+                folder = await chooseCodeFolder(reopeningPanel: true)
+            }
+            guard let folder else { return }   // cancelled
+            do {
+                let worktree = try await WorktreeManager.shared.ensureWorktree(
+                    for: ref, codeFolder: URL(fileURLWithPath: folder, isDirectory: true)
+                ) { [weak self] step in
+                    Task { @MainActor in
+                        guard let self, self.editorJobs[key]?.job == job else { return }
+                        self.editorJobs[key]?.step = step.label
+                    }
+                }
+                try await EditorCatalog.open(worktree.url, in: editor)
+                if let note = worktree.note, generation == sessionGeneration {
+                    reportActionError("Opened #\(ref.number) — \(note)")
+                }
+            } catch {
+                NSLog("Queue: couldn't open %@#%d in %@: %@",
+                      ref.repo.fullName, ref.number, editor.name, error.localizedDescription)
+                guard generation == sessionGeneration else { return }
+                reportActionError("Couldn't open #\(ref.number) — \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// The demo repos aren't on GitHub: walk through the steps, then say so.
+    private func demoOpenInEditor(_ ref: BranchRef, key: String, job: Int) async {
+        for step in [WorkspaceStep.fetching(branch: ref.branch), .addingWorktree] {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard editorJobs[key]?.job == job else { return }
+            editorJobs[key]?.step = step.label
+        }
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        reportActionError("Demo data — \(ref.repo.fullName) isn't on GitHub, so there's no branch to open.")
+    }
+
+    /// Asks for the code folder (the folder holding your clones) and saves
+    /// it; nil when cancelled. From Settings, the open panel is a sheet on
+    /// `window`. From a row (`reopeningPanel`), the Queue panel steps aside
+    /// for it and comes back after, showing the branch opening. A second ask
+    /// while the open panel is up waits for that one.
+    @discardableResult
+    func chooseCodeFolder(attachedTo window: NSWindow? = nil, reopeningPanel: Bool = false) async -> String? {
+        if let pending = codeFolderChoice { return await pending.value }
+        let task = Task { () -> String? in
+            if reopeningPanel { closePanel?() }
+            let panel = NSOpenPanel()
+            panel.title = "Choose your code folder"
+            panel.message = "Choose your code folder: the folder your clones are in, like ~/Projects. "
+                + "Queue opens each PR's branch on a worktree beside its clone, and clones repos you don't have into it."
+            panel.prompt = "Choose"
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.canCreateDirectories = true
+            panel.directoryURL = settings.codeFolder.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? Self.likelyCodeFolder
+            // Turns down a repo (often the folder highlighted as you click
+            // Choose), saying why, and stays open. The panel's delegate is
+            // weak: kept until the panel closes.
+            let validator = CodeFolderValidator()
+            panel.delegate = validator
+            // An accessory app's panel would open behind the frontmost app.
+            NSApp.activate(ignoringOtherApps: true)
+            let response = await withCheckedContinuation { continuation in
+                if let window {
+                    panel.beginSheetModal(for: window) { continuation.resume(returning: $0) }
+                } else {
+                    panel.begin { continuation.resume(returning: $0) }
+                }
+            }
+            withExtendedLifetime(validator) {}
+            var chosen: String?
+            if response == .OK, let url = panel.url {
+                chosen = url.standardizedFileURL.path
+                settings.codeFolder = chosen
+            }
+            if reopeningPanel { showPanel?() }
+            return chosen
+        }
+        codeFolderChoice = task
+        let chosen = await task.value
+        codeFolderChoice = nil
+        return chosen
+    }
+
+    /// Where the open panel starts: the usual code folders, else home.
+    private static var likelyCodeFolder: URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        for name in ["Projects", "Developer", "Code", "code", "src", "dev", "repos", "GitHub"] {
+            let url = home.appendingPathComponent(name, isDirectory: true)
+            var directory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &directory), directory.boolValue {
+                return url
+            }
+        }
+        return home
+    }
+
+    /// Removes the worktrees Queue added for PRs since merged or closed
+    /// (WorktreeManager.cleanup keeps any with work in them, and never
+    /// touches what Queue didn't make). After a refresh that loaded the
+    /// inbox and your PRs, at most every `cleanupInterval`: PRs listed there
+    /// are open, so only the others are looked up. Reports only to the log.
+    private func cleanUpWorktrees() {
+        // Demo repos are fake, and the registry may hold real worktrees.
+        guard !Self.isDemo, !cleaningUp else { return }
+        let now = Date()
+        if let last = lastCleanupAt, now.timeIntervalSince(last) < Self.cleanupInterval { return }
+        lastCleanupAt = now
+        var open = Set(prs.compactMap { $0.branchRef?.prNodeID })
+        for case .review(let request) in inbox {
+            if let id = request.branchRef?.prNodeID ?? request.nodeID { open.insert(id) }
+        }
+        let source = dataSource
+        cleaningUp = true
+        Task {
+            defer { cleaningUp = false }
+            let manager = WorktreeManager.shared
+            let ids = await manager.trackedPRNodeIDs().filter { !open.contains($0) }
+            guard !ids.isEmpty else { return }
+            let lifecycles: [String: PRLifecycle]
+            do {
+                lifecycles = try await source.prLifecycles(ids)
+            } catch {
+                NSLog("Queue: worktree cleanup skipped, couldn't look up %d PRs: %@", ids.count, error.localizedDescription)
+                return
+            }
+            for result in await manager.cleanup(lifecycles: lifecycles) {
+                NSLog("Queue: %@", Self.describe(result))
+            }
+        }
+    }
+
+    /// One log line per cleanup result.
+    private static func describe(_ result: CleanupResult) -> String {
+        let pr = "\(result.repo.fullName)#\(result.number)"
+        let place = result.path.map { " at \(WorkspaceError.abbreviated($0))" } ?? ""
+        // A refused `git branch -d` reads "kept the branch: <git's reason>".
+        let reason = result.reason.map { reason in
+            let prefix = "kept the branch: "
+            return reason.hasPrefix(prefix) ? String(reason.dropFirst(prefix.count)) : reason
+        }
+        switch result.action {
+        case .removedWorktree:
+            if result.branchDeleted { return "removed the worktree for \(pr)\(place) and its branch \(result.branch)" }
+            let kept = reason.map { "; kept its branch \(result.branch) (\($0))" } ?? ""
+            return "removed the worktree for \(pr)\(place)\(kept)"
+        case .keptWorktree:
+            return "kept the worktree for \(pr)\(place)" + (reason.map { ": \($0)" } ?? "")
+        case .deletedBranch:
+            return "deleted branch \(result.branch) of \(pr)"
+        case .keptBranch:
+            return "kept branch \(result.branch) of \(pr)" + (reason.map { " (\($0))" } ?? "")
+        }
     }
 
     func open(_ url: URL) {
@@ -998,5 +1220,16 @@ final class AppState: ObservableObject {
         }
         // Live mode: GitHubDataSource takes over after onboarding/auth.
         return LiveBootstrap.makeState(settings: settings)
+    }
+}
+
+/// The code folder's open panel turns down a repo, or a folder inside one:
+/// Queue would clone into that checkout (and its scan never looks inside a
+/// repo). The panel shows the error and stays open.
+private final class CodeFolderValidator: NSObject, NSOpenSavePanelDelegate {
+    func panel(_ sender: Any, validate url: URL) throws {
+        if WorkspacePath.repo(containing: WorkspacePath.canonical(url.path)) != nil {
+            throw WorkspaceError.codeFolderInRepo(url.path)
+        }
     }
 }

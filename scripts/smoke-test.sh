@@ -16,6 +16,7 @@ EXPECTED=(app-icon.png onboarding-step1.png onboarding-token.png)
 for appearance in dark light; do
     for tab in inbox prs issues stats; do EXPECTED+=("panel-$tab-$appearance.png"); done
     for tab in inbox prs; do EXPECTED+=("panel-$tab-done-$appearance.png"); done
+    for variant in inbox-hover prs-hover prs-merge; do EXPECTED+=("panel-$variant-$appearance.png"); done
     for icon in all-clear count count-ci dot ci-failing; do EXPECTED+=("icon-$icon-$appearance.png"); done
     EXPECTED+=("settings-$appearance.png")
 done

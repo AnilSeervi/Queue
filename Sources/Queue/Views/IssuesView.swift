@@ -3,8 +3,8 @@ import SwiftUI
 // Issues tab (spec 1a "Issues tab", screenshot 03):
 // assigned issues grouped by repo; circle-dot success icon; meta line
 // "#4788 · assigned 2d ago" with the label chip right after; trailing age
-// (amber when stale). Click a row to open it. Hover action: open — no
-// approve/merge.
+// (amber when stale). Click a row to open it. Hover action: the open icon —
+// no approve/merge.
 
 struct IssuesView: View {
     @EnvironmentObject var state: AppState
@@ -60,9 +60,7 @@ struct IssuesView: View {
                 AgeText(age: issue.age)
             },
             actions: {
-                IconActionButton(systemName: "arrow.up.right", help: "Open on GitHub") {
-                    state.open(issue.url)
-                }
+                OpenOnGitHubButton { state.open(issue.url) }
             }
         )
     }

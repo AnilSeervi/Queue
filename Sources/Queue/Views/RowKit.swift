@@ -29,7 +29,9 @@ struct RepoGroupHeader: View {
 
 /// List row: leading 15px icon slot, title + meta, trailing slot (age/pill),
 /// hover reveals action cluster over a horizontal fade; row bg lightens.
-/// A click anywhere outside the row's buttons calls `onOpen`.
+/// `pinned` shows the cluster without the pointer (a branch opening in the
+/// editor keeps its spinner in view). A click anywhere outside the row's
+/// buttons calls `onOpen`.
 struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Trailing: View, Actions: View>: View {
     @ViewBuilder var leading: () -> Leading
     var title: String
@@ -38,6 +40,7 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
     @ViewBuilder var metaAccessory: () -> MetaAccessory
     @ViewBuilder var trailing: () -> Trailing
     @ViewBuilder var actions: () -> Actions
+    var pinned: Bool
     var onOpen: () -> Void
 
     @State private var hovered = false
@@ -46,6 +49,7 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
     init(
         title: String,
         meta: String,
+        pinned: Bool = false,
         onOpen: @escaping () -> Void,
         @ViewBuilder leading: @escaping () -> Leading,
         @ViewBuilder titleAccessory: @escaping () -> TitleAccessory = { EmptyView() },
@@ -55,6 +59,7 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
     ) {
         self.title = title
         self.meta = meta
+        self.pinned = pinned
         self.onOpen = onOpen
         self.leading = leading
         self.titleAccessory = titleAccessory
@@ -65,6 +70,7 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
 
     var body: some View {
         let ds = DS(scheme)
+        let active = hovered || pinned
         HStack(alignment: .center, spacing: 10) {
             leading()
                 .frame(width: 15, height: 15)
@@ -94,17 +100,19 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
         }
         .padding(EdgeInsets(top: 7, leading: 14, bottom: 7, trailing: 14))
         .frame(minHeight: 30)
-        .background(hovered ? ds.rowHover : .clear)
+        .background(active ? ds.rowHover : .clear)
         .overlay(alignment: .trailing) {
-            if hovered {
+            if active {
                 HStack(spacing: 0) {
                     LinearGradient(
                         colors: [ds.hoverFadeBase.opacity(0), ds.hoverFadeBase],
                         startPoint: .leading, endPoint: .trailing
                     )
                     .frame(width: 28)
+                    // Full row height, like the fade beside it.
                     HStack(spacing: 6) { actions() }
                         .padding(.trailing, 8)
+                        .frame(maxHeight: .infinity)
                         .background(ds.hoverFadeBase)
                 }
                 .transition(.opacity)
@@ -123,52 +131,149 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
 
 // MARK: - Buttons
 
-/// Text action button, e.g. Approve / Merge / Re-run / ⌥ Copy branch.
-struct TextActionButton: View {
-    var label: String
-    var color: Color
-    var background: Color
-    /// Tooltip; nil = none.
-    var help: String? = nil
-    var action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(label)
-                .font(DSFont.button())
-                .foregroundStyle(color)
-                .padding(EdgeInsets(top: 4, leading: 9, bottom: 4, trailing: 9))
-                .background(background, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .help(help ?? "")
-    }
-}
-
-/// 24px square icon button (✓ Done, open on GitHub).
+/// 24px square icon button: every hover action (Approve, Merge, Re-run,
+/// Copy branch, Open in editor, ✓ Done, open on GitHub). `tint` colors the
+/// symbol and its backdrop (approve green, merge purple, re-run amber); nil
+/// is the neutral gray. `label` widens it into a pill with the text after
+/// the symbol (Merge asking to confirm). `isBusy` swaps the symbol for a
+/// spinner; the button still takes the click (and its owner ignores it), so
+/// the click can't fall through to the row and open it.
 struct IconActionButton: View {
-    var systemName: String?
+    var systemName: String
+    /// Tooltip.
     var help: String
+    /// What VoiceOver calls it; nil = `help`.
+    var accessibilityName: String? = nil
+    var tint: Color? = nil
+    var label: String? = nil
+    var isBusy = false
     var action: () -> Void
+
+    @State private var hovered = false
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         let ds = DS(scheme)
+        let fg = tint ?? (ds.dark ? Color.white.opacity(0.6) : Color.black.opacity(0.6))
+        let bg: Color = {
+            if let tint { return tint.opacity(label != nil ? 0.28 : hovered ? 0.24 : 0.14) }
+            return hovered ? ds.controlActive : ds.control
+        }()
         Button(action: action) {
-            Group {
-                if let systemName {
+            HStack(spacing: 5) {
+                if isBusy {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 12, height: 12)
+                } else {
                     Image(systemName: systemName)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 11, weight: tint == nil ? .medium : .semibold))
+                }
+                if let label {
+                    Text(label)
+                        .font(DSFont.button())
+                        .lineLimit(1)
+                        .fixedSize()
                 }
             }
-            .foregroundStyle(ds.dark ? Color.white.opacity(0.6) : Color.black.opacity(0.6))
-            .frame(width: 24, height: 24)
-            .background(ds.control, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .foregroundStyle(fg)
+            .padding(.horizontal, label == nil ? 0 : 8)
+            .frame(minWidth: 24, minHeight: 24)
+            .background(bg, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { hovered = $0 }
         .help(help)
         // VoiceOver names the button by what it does, not by its symbol.
-        .accessibilityLabel(help)
+        .accessibilityLabel(accessibilityName ?? help)
+    }
+}
+
+/// Copy branch: puts the branch name on the clipboard, and shows a
+/// checkmark for a second to say so.
+struct CopyBranchButton: View {
+    @EnvironmentObject var state: AppState
+    var branch: String
+
+    @State private var copied = false
+    @State private var generation = 0
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        IconActionButton(
+            systemName: copied ? "checkmark" : "doc.on.doc",
+            help: copied ? "Copied \(branch)" : "Copy branch \(branch)",
+            accessibilityName: copied ? "Copied" : "Copy branch name",
+            tint: copied ? DS(scheme).success : nil,
+            action: copy
+        )
+    }
+
+    private func copy() {
+        state.copyBranch(branch)
+        generation += 1
+        let current = generation
+        withAnimation(.easeOut(duration: 0.12)) { copied = true }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard current == generation else { return }
+            withAnimation(.easeOut(duration: 0.12)) { copied = false }
+        }
+    }
+}
+
+/// Open in editor: the PR's branch, on a worktree beside your clone, in the
+/// editor chosen in Settings (AppState.openInEditor). Spins while Queue
+/// clones or fetches; the tooltip says which step it's on.
+struct OpenInEditorButton: View {
+    @EnvironmentObject var state: AppState
+    var ref: BranchRef
+    @Environment(\.rowPreview) private var preview
+
+    var body: some View {
+        let step = state.editorStep(for: ref)
+            ?? (preview.busy.contains(AppState.editorKey(ref)) ? WorkspaceStep.fetching(branch: ref.branch).label : nil)
+        let editor = EditorCatalog.preferred(state.settings.editorBundleID)?.name ?? "your editor"
+        IconActionButton(
+            systemName: "chevron.left.forwardslash.chevron.right",
+            help: step ?? "Open in \(editor) (worktree)",
+            accessibilityName: step ?? "Open in \(editor) on a worktree",
+            isBusy: step != nil
+        ) {
+            state.openInEditor(ref)
+        }
+    }
+}
+
+/// Open on GitHub (↗).
+struct OpenOnGitHubButton: View {
+    var action: () -> Void
+
+    var body: some View {
+        IconActionButton(systemName: "arrow.up.right", help: "Open on GitHub", action: action)
+    }
+}
+
+// MARK: - Snapshot preview
+
+/// Snapshotter only: rows drawn as if the pointer were on them (their
+/// actions showing), by row id; My PRs rows with Merge asking to confirm;
+/// branches (AppState.editorKey) shown opening in the editor.
+struct RowPreview {
+    var hovered: Set<String> = []
+    var confirmingMerge: Set<String> = []
+    var busy: Set<String> = []
+}
+
+private struct RowPreviewKey: EnvironmentKey {
+    static let defaultValue = RowPreview()
+}
+
+extension EnvironmentValues {
+    var rowPreview: RowPreview {
+        get { self[RowPreviewKey.self] }
+        set { self[RowPreviewKey.self] = newValue }
     }
 }
 
