@@ -127,14 +127,14 @@ enum MockData {
                  age: Age(date: ago(days: 1)), url: prURL(itsmCore, 4835),
                  mergeState: .blocked, reviewDecision: .changesRequested,
                  changesRequested: true, headSHA: "e8a1f4c09d", mergeMethod: .squash,
-                 updatedAt: ago(hours: 2)),
+                 updatedAt: ago(hours: 2), unresolvedThreads: 3),
             MyPR(id: "pr-4830", repo: itsmCore, number: 4830,
                  title: "Rate-limit audit log exports", branch: "feat/audit-rate-limit",
                  ci: .running(pill: nil), approvals: 1,
-                 age: Age(date: ago(hours: 3)), url: prURL(itsmCore, 4830),
+                 age: Age(date: ago(hours: 2, days: 2)), url: prURL(itsmCore, 4830),
                  requestedReviewers: ["tkole"], mergeState: .blocked,
                  reviewDecision: .reviewRequired, headSHA: "a1b2c3d4e5", mergeMethod: .squash,
-                 updatedAt: ago(minutes: 12)),
+                 updatedAt: ago(minutes: 12), unresolvedThreads: 1, reviewerMentions: ["tkole"]),
             MyPR(id: "pr-2219", repo: webClient, number: 2219,
                  title: "Keyboard shortcuts for request triage", branch: "feat/triage-shortcuts",
                  ci: .passing, approvals: 1,
@@ -312,6 +312,7 @@ final class MockDataSource: QueueDataSource {
     /// Fixture states (MockData.lifecycles). Any other id, such as a live
     /// session's worktree PR, is omitted the way GitHub omits ids it can't
     /// resolve, so demo mode never cleans up a real worktree.
+    func nudgeReviewers(_ pr: MyPR) async throws {}
     func prLifecycles(_ nodeIDs: [String]) async throws -> [String: PRLifecycle] {
         let known = MockData.lifecycles
         var states: [String: PRLifecycle] = [:]

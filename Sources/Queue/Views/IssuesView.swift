@@ -19,23 +19,21 @@ struct IssuesView: View {
 
     var body: some View {
         let ds = DS(scheme)
-        let groups = groupByRepo(state.issues) { $0.repo }
+        let groups = groupByRepo(state.searchedIssues) { $0.repo }
             .map { RepoGroup(repo: $0.repo, items: $0.items) }
 
         VStack(spacing: 0) {
             if groups.isEmpty {
-                TabEmptyState(sections: [.issues], text: "No assigned issues")
+                TabEmptyState(sections: [.issues],
+                              text: state.isSearching ? "No matches for “\(state.query.raw)”" : "No assigned issues")
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(groups) { group in
-                            RepoGroupHeader(repo: group.repo, count: group.items.count)
-                            ForEach(group.items) { issue in
-                                row(for: issue, ds: ds)
-                            }
+                ListScrollView(tab: .issues) {
+                    ForEach(groups) { group in
+                        RepoGroupHeader(repo: group.repo, count: group.items.count)
+                        ForEach(group.items) { issue in
+                            row(for: issue, ds: ds).id(issue.id)
                         }
                     }
-                    .padding(.bottom, 6)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
@@ -47,6 +45,9 @@ struct IssuesView: View {
         QueueRow(
             title: issue.title,
             meta: issue.meta,
+            selected: state.selectedRowID == issue.id,
+            muteRepo: issue.repo,
+            onMute: { state.mute(issue.repo) },
             onOpen: { state.open(issue.url) },
             leading: {
                 CircleDotIcon(color: ds.success, size: 15)

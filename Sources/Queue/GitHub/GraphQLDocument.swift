@@ -161,13 +161,14 @@ enum QueueGraphQL {
                 pendingReviewers: reviewRequests(first: 20) {
                   nodes {
                     requestedReviewer {
-                      ... on User { handle: login }
+                      ... on User { handle: login mention: login }
                       ... on Bot { handle: login }
                       ... on Mannequin { handle: login }
-                      ... on Team { handle: name }
+                      ... on Team { handle: name mention: combinedSlug }
                     }
                   }
                 }
+                threads: reviewThreads(first: 50) { nodes { isResolved } }
                 checks: statusCheckRollup {
                   state
                   contexts(first: 100) { totalCount nodes { ...QueueCheck ...QueueStatus } }
@@ -478,6 +479,10 @@ struct ReviewRequestPayload: Decodable {
     var stackEntry: StackEntryPayload?
 }
 
+struct ReviewThread: Decodable {
+    var isResolved: Bool?
+}
+
 struct MyPRPayload: Decodable {
     /// A reviewer's latest approve / request-changes.
     struct Verdict: Decodable {
@@ -487,6 +492,9 @@ struct MyPRPayload: Decodable {
     struct PendingReviewer: Decodable {
         struct Reviewer: Decodable {
             var handle: String?     // login, or a team's name
+            /// What an @-mention needs: a person's login, a team's org/slug.
+            /// Bots and mannequins have none.
+            var mention: String?
         }
         var requestedReviewer: Reviewer?
     }
@@ -533,6 +541,7 @@ struct MyPRPayload: Decodable {
     var pendingReviewers: NodeList<PendingReviewer>?
     var stack: StackPayload?
     var stackEntry: StackEntryPayload?
+    var threads: NodeList<ReviewThread>?
     /// nil when the head commit has no checks or statuses — or when GitHub
     /// nulled it with an error, which the data source tells apart.
     var checks: Checks?

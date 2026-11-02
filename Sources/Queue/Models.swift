@@ -316,6 +316,11 @@ struct MyPR: Identifiable, Hashable {
     var branchRef: BranchRef? = nil
     /// Its stack, when it's in one.
     var stack: StackInfo? = nil
+    /// Review threads nobody has resolved yet (of the first 50).
+    var unresolvedThreads = 0
+    /// @-mentionable requested reviewers who haven't responded: people's
+    /// logins and teams' org/slug (no bots), for Nudge.
+    var reviewerMentions: [String] = []
 
     var meta: String { "#\(number) · \(branch)" }
 

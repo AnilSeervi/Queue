@@ -305,7 +305,7 @@ final class StatusItemController: NSObject {
         if case .needsYouCount(let n, _) = iconState {
             countText = "\(n)"
             let textWidth = (countText! as NSString).size(
-                withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]
+                withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)]
             ).width
             width += textWidth + 4
         }
@@ -339,7 +339,7 @@ final class StatusItemController: NSObject {
                 }
                 if let countText {
                     let attributes: [NSAttributedString.Key: Any] = [
-                        .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                        .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
                         .foregroundColor: mono,
                     ]
                     let size = (countText as NSString).size(withAttributes: attributes)

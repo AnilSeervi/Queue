@@ -21,12 +21,14 @@ struct MyPRsView: View {
     }
 
     var body: some View {
-        let prs = state.prs
+        let prs = state.searchedPRs
+        let done = state.searched(state.donePRs)
         VStack(spacing: 0) {
             if prs.isEmpty {
-                EmptyListTab(tab: .prs, sections: [.prs], text: "No open PRs") {
+                EmptyListTab(tab: .prs, sections: [.prs],
+                             text: state.isSearching ? "No matches for “\(state.query.raw)”" : "No open PRs") {
                     mergedLine
-                    DoneSection(tab: .prs, items: state.donePRs)
+                    DoneSection(tab: .prs, items: done)
                 }
             } else {
                 ListScrollView(tab: .prs) {
@@ -37,15 +39,15 @@ struct MyPRsView: View {
                         ForEach(stackSegments(group.items, stack: \.stack)) { segment in
                             switch segment {
                             case .single(let pr):
-                                MyPRRowView(pr: pr)
+                                MyPRRowView(pr: pr).id(pr.id)
                             case .stack(let stack, let layers):
                                 StackHeader(stack: stack)
-                                ForEach(layers) { pr in MyPRRowView(pr: pr) }
+                                ForEach(layers) { pr in MyPRRowView(pr: pr).id(pr.id) }
                             }
                         }
                     }
                     mergedLine
-                    DoneSection(tab: .prs, items: state.donePRs)
+                    DoneSection(tab: .prs, items: done)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
@@ -56,6 +58,9 @@ struct MyPRsView: View {
     @ViewBuilder private var mergedLine: some View {
         if let merged = state.mergedTitles.last {
             MergedSummaryLine(title: merged)
+        }
+        if let nudge = state.lastNudge {
+            NudgedSummaryLine(text: nudge)
         }
     }
 }
@@ -71,6 +76,9 @@ private struct MyPRRowView: View {
     @State private var confirmingMerge = false
     @State private var confirmGeneration = 0
     @State private var confirmShownAt = Date.distantPast
+    /// Nudge asks for a second click too: it posts a comment others see.
+    @State private var confirmingNudge = false
+    @State private var nudgeGeneration = 0
     @Environment(\.colorScheme) private var scheme
     @Environment(\.rowPreview) private var preview
 
@@ -85,10 +93,14 @@ private struct MyPRRowView: View {
             title: pr.title,
             meta: pr.meta,
             pinned: pinned,
+            selected: state.selectedRowID == pr.id,
+            muteRepo: pr.repo,
+            onMute: { state.mute(pr.repo) },
             onOpen: { state.open(pr.url) },
             leading: { statusIcon(ds) },
             trailing: {
                 HStack(spacing: 6) {
+                    if pr.unresolvedThreads > 0 { ThreadsChip(count: pr.unresolvedThreads) }
                     if let stack = pr.stack { StackPositionChip(stack: stack) }
                     StatusPillView(text: pr.pillText, kind: pr.pillKind)
                 }
@@ -180,6 +192,18 @@ private struct MyPRRowView: View {
                 withAnimation(.easeOut(duration: 0.15)) { state.rerunChecks(pr) }
             }
         }
+        if state.canNudge(pr) {
+            IconActionButton(
+                systemName: "hand.wave",
+                help: confirmingNudge
+                    ? "Click again to comment, mentioning \(state.nudgeNames(pr))"
+                    : "Nudge \(state.nudgeNames(pr)) — posts a comment asking for a review",
+                accessibilityName: confirmingNudge ? "Confirm nudge" : "Nudge reviewers",
+                label: confirmingNudge ? "Nudge \(state.nudgeNames(pr))?" : nil,
+                action: nudgeTapped
+            )
+            .onDisappear { confirmingNudge = false }
+        }
         if let branch = copyableBranch {
             CopyBranchButton(branch: branch)
         }
@@ -219,6 +243,23 @@ private struct MyPRRowView: View {
         guard confirmingMerge else { return }
         confirmGeneration += 1
         confirmingMerge = false
+    }
+
+    private func nudgeTapped() {
+        if confirmingNudge {
+            confirmingNudge = false
+            nudgeGeneration += 1
+            state.nudge(pr)
+            return
+        }
+        nudgeGeneration += 1
+        let generation = nudgeGeneration
+        withAnimation(.easeOut(duration: 0.12)) { confirmingNudge = true }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: Self.confirmWindow)
+            guard generation == nudgeGeneration else { return }
+            withAnimation(.easeOut(duration: 0.12)) { confirmingNudge = false }
+        }
     }
 }
 

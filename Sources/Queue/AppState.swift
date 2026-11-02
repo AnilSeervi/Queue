@@ -42,6 +42,8 @@ protocol QueueDataSource {
     func refresh() async throws -> Snapshot
     /// Approve, pinned to `request.headSHA`.
     func approve(_ request: ReviewRequest) async throws
+    /// Comments on `pr` @-mentioning `pr.reviewerMentions`.
+    func nudgeReviewers(_ pr: MyPR) async throws
     /// Merge with `pr.mergeMethod`, pinned to `pr.headSHA` (409 if it moved).
     func merge(_ pr: MyPR) async throws
     /// Re-run failed jobs in every run in `pr.failedRunIDs`; returns how many
@@ -99,6 +101,9 @@ final class SettingsStore: ObservableObject {
     /// Folder holding your clones (e.g. ~/Projects); nil until chosen —
     /// the first "open in editor" asks for it.
     @Published var codeFolder: String? { didSet { defaults.set(codeFolder, forKey: "codeFolder") } }
+    /// Repos you muted (owner/name): out of the lists, the badge,
+    /// notifications and Up next. Right-click a row to add; Settings removes.
+    @Published var mutedRepos: [String] { didSet { defaults.set(mutedRepos, forKey: "mutedRepos") } }
     /// Bundle id of the editor branches open in; nil = first installed one.
     @Published var editorBundleID: String? { didSet { defaults.set(editorBundleID, forKey: "editorBundleID") } }
 
@@ -120,6 +125,7 @@ final class SettingsStore: ObservableObject {
         notifyCIFailures = defaults.object(forKey: "notifyCIFailures") as? Bool ?? true
         notifyPRReady = defaults.object(forKey: "notifyPRReady") as? Bool ?? true
         codeFolder = defaults.string(forKey: "codeFolder")
+        mutedRepos = defaults.stringArray(forKey: "mutedRepos") ?? []
         editorBundleID = defaults.string(forKey: "editorBundleID")
 
         for key in Self.retiredKeys where defaults.object(forKey: key) != nil {
@@ -158,8 +164,30 @@ final class AppState: ObservableObject {
 
     // UI
     @Published var activeTab: PanelTab {
-        didSet { UserDefaults.standard.set(activeTab.rawValue, forKey: "activeTab") }
+        didSet {
+            UserDefaults.standard.set(activeTab.rawValue, forKey: "activeTab")
+            if activeTab != oldValue { selectedRowID = nil }
+        }
     }
+    // Panel search and keyboard selection (this session; PanelNavigation.swift).
+    @Published var searchActive = false
+    @Published var searchText: [PanelTab: String] = [:]
+    @Published var selectedRowID: String?
+    /// Bumped to put the keyboard focus in the search field.
+    @Published var searchFocusToken = 0
+    /// The last refresh failed (Retry is offered).
+    @Published private(set) var refreshFailed = false
+    /// Which of nextSteps the footer shows (› steps on).
+    @Published var upNextIndex = 0
+    /// When Queue last nudged each PR's reviewers (kept a day, across launches).
+    @Published var nudgedAt: [String: Date] = (UserDefaults.standard.dictionary(forKey: "nudgedAt") as? [String: Date]) ?? [:] {
+        didSet {
+            let fresh = nudgedAt.filter { Date().timeIntervalSince($0.value) < Self.nudgeAgain }
+            UserDefaults.standard.set(fresh, forKey: "nudgedAt")
+        }
+    }
+    /// "Nudged @ana on #2232", under My PRs after a nudge.
+    @Published var lastNudge: String?
     @Published var auth: AuthState
 
     // Session mutations (spec "State Management": session approvedIds/mergedIds).
@@ -241,7 +269,8 @@ final class AppState: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var refreshQueued = false
     /// Bumped by signOut(): work started before it must not land after it.
-    private var sessionGeneration = 0
+    /// Bumped on sign-out, so a late result from the old session is dropped.
+    private(set) var sessionGeneration = 0
     /// When each section last loaded ("showing data from 3m ago").
     private var sectionLoadedAt: [SnapshotSection: Date] = [:]
     /// When the last refresh pass finished, whatever its outcome.
@@ -307,14 +336,14 @@ final class AppState: ObservableObject {
         })
         let logged = doneLog.items.filter { $0.outcome != .merged }
         return DoneItem.combine(doneReviewsOnGitHub + logged, now: Date())
-            .filter { !open.contains($0.id) }
+            .filter { !open.contains($0.id) && !isMuted($0.repo) }
     }
 
     /// Your PRs merged in the last `doneWindow`, newest first, including
     /// ones merged here that GitHub's search hasn't caught up with.
     var donePRs: [DoneItem] {
         let logged = doneLog.items.filter { $0.outcome == .merged }
-        return DoneItem.combine(mergedOnGitHub + logged, now: Date())
+        return DoneItem.combine(mergedOnGitHub + logged, now: Date()).filter { !isMuted($0.repo) }
     }
 
     func toggleDone(_ tab: PanelTab) {
@@ -327,21 +356,6 @@ final class AppState: ObservableObject {
     /// changes requested or conflicts; each PR counted once).
     var badgeCount: Int {
         inbox.count + prs.filter(\.needsYou).count
-    }
-
-    /// Footer "up next": the oldest item that needs you (inbox + your PRs
-    /// that need you).
-    var upNext: (title: String, age: Age, url: URL)? {
-        var candidates: [(String, Age, URL)] = inbox.map { entry in
-            switch entry {
-            case .review(let request): return (request.title, request.age, request.url)
-            case .mention(let mention): return (mention.title, mention.age, mention.url)
-            }
-        }
-        candidates += prs.filter(\.needsYou).map { ($0.title, $0.age, $0.url) }
-        return candidates
-            .min(by: { $0.1.date < $1.1.date })
-            .map { (title: $0.0, age: $0.1, url: $0.2) }
     }
 
     var statusIconState: StatusIconState {
@@ -494,9 +508,10 @@ final class AppState: ObservableObject {
             mentions = inbox.filter { !$0.isReview }
         }
         // Reviews first, then mentions; groupByRepo keeps per-repo order.
-        inbox = reviews + mentions
-        if loaded(.prs) { prs = snapshot.prs.filter { !mergedIds.contains($0.id) } }
-        if loaded(.issues) { issues = snapshot.issues }
+        // Muted repos never get in.
+        inbox = (reviews + mentions).filter { !isMuted($0.repo) }
+        if loaded(.prs) { prs = snapshot.prs.filter { !mergedIds.contains($0.id) && !isMuted($0.repo) } }
+        if loaded(.issues) { issues = snapshot.issues.filter { !isMuted($0.repo) } }
         if loaded(.stats) { stats = snapshot.stats }
         if loaded(.done) {
             doneReviewsOnGitHub = snapshot.doneReviews
@@ -511,6 +526,7 @@ final class AppState: ObservableObject {
         if Self.badgeSections.isSubset(of: fresh) { lastRefreshedAt = now }
         lastAttemptAt = now
         refreshStatus = staleDataMessage(failed)
+        refreshFailed = refreshStatus != nil
         if let error = actionError, now.timeIntervalSince(error.at) >= Self.actionErrorHold { actionError = nil }
         inlineError = actionError?.message ?? refreshStatus
         if let sso = snapshot.sso {
@@ -704,14 +720,14 @@ final class AppState: ObservableObject {
     // MARK: Actions (optimistic; restore row + inline error on API failure)
 
     /// Shows why an action failed; see `actionError`.
-    private func reportActionError(_ message: String) {
+    func reportActionError(_ message: String) {
         actionError = (message, Date())
         inlineError = message
         onStateChange?()
     }
 
     /// A new action dismisses the previous action's error.
-    private func clearActionError() {
+    func clearActionError() {
         guard let error = actionError else { return }
         actionError = nil
         if inlineError == error.message { inlineError = refreshStatus }
@@ -1209,6 +1225,9 @@ final class AppState: ObservableObject {
         inlineError = nil
         actionError = nil
         refreshStatus = nil
+        refreshFailed = false
+        searchActive = false; searchText = [:]; selectedRowID = nil
+        upNextIndex = 0; lastNudge = nil
         inbox = []; prs = []; issues = []; stats = nil
         lastRefreshedAt = nil
         lastAttemptAt = nil

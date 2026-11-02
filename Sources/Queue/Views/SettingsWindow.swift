@@ -185,6 +185,23 @@ struct SettingsContentView: View {
                 hairline
                 editorRow
             }
+            // Repos muted from a row's right-click menu.
+            if !settings.mutedRepos.isEmpty {
+                group("MUTED REPOS") {
+                    ForEach(Array(settings.mutedRepos.enumerated()), id: \.element) { index, repo in
+                        if index > 0 { hairline }
+                        HStack(spacing: 8) {
+                            Text(repo)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(ds.textPrimary)
+                            Spacer(minLength: 8)
+                            Button("Unmute") { state.unmute(repo) }
+                                .controlSize(.small)
+                        }
+                        .padding(rowPadding)
+                    }
+                }
+            }
         }
         .padding(EdgeInsets(top: 16, leading: 18, bottom: 16, trailing: 18))
         .frame(maxWidth: .infinity, alignment: .leading)

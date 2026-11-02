@@ -140,6 +140,18 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
 
     /// Approve, pinned to the commit the row was fetched at: commits pushed
     /// after the last refresh stay unreviewed.
+    /// Posts a comment on the PR @-mentioning the reviewers who haven't
+    /// responded yet.
+    func nudgeReviewers(_ pr: MyPR) async throws {
+        guard !pr.reviewerMentions.isEmpty else { throw GitHubError.api("No reviewers to nudge on #\(pr.number)") }
+        let names = pr.reviewerMentions.map { "@\($0)" }.joined(separator: " ")
+        try await client.rest(
+            method: "POST",
+            path: "repos/\(pr.repo.fullName)/issues/\(pr.number)/comments",
+            body: ["body": "\(names) friendly ping — this is ready for your review when you have a moment. Thanks!"]
+        )
+    }
+
     func approve(_ request: ReviewRequest) async throws {
         var body: [String: Any] = ["event": "APPROVE"]
         if let sha = request.headSHA { body["commit_id"] = sha }
@@ -834,6 +846,8 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
         let changesRequested = decision == .changesRequested
             || verdicts.contains { $0.state == "CHANGES_REQUESTED" }
         let requested = (node.pendingReviewers?.values ?? []).compactMap { $0.requestedReviewer?.handle }
+        let mentions = (node.pendingReviewers?.values ?? []).compactMap { $0.requestedReviewer?.mention }
+        let unresolved = (node.threads?.values ?? []).filter { $0.isResolved == false }.count
 
         let pr = MyPR(
             id: "pr-\(repo.fullName)#\(number)",
@@ -864,7 +878,9 @@ final class GitHubDataSource: QueueDataSource, @unchecked Sendable {
                 headRepo: node.headRepo, nodeID: node.id, isMine: true,
                 stack: stackInfo(node.stack, entry: node.stackEntry)
             ),
-            stack: stackInfo(node.stack, entry: node.stackEntry)
+            stack: stackInfo(node.stack, entry: node.stackEntry),
+            unresolvedThreads: unresolved,
+            reviewerMentions: mentions
         )
         return (pr, checks)
     }

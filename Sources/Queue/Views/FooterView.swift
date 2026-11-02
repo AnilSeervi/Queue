@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// Footer: "Up next" — the oldest item that needs you (review requests,
-/// mentions, and your PRs with failing CI, changes requested or conflicts),
-/// clickable to open on GitHub (replaces the spec's per-repo CI strip: zero
-/// setup, serves the triage loop directly). Right side: time-since-refresh +
-/// Settings gear.
+/// Footer: "Up next" — the most useful next step (AppState.nextSteps:
+/// feedback to address, something to merge, CI to fix, a reviewer to nudge,
+/// a quick review…), clickable to open on GitHub, with › stepping through the
+/// rest. Right side: time-since-refresh + Settings gear.
 struct FooterView: View {
     @EnvironmentObject var state: AppState
     @Environment(\.colorScheme) private var scheme
@@ -14,27 +13,54 @@ struct FooterView: View {
         VStack(spacing: 0) {
             Rectangle().fill(ds.hairline).frame(height: 1)
             HStack(spacing: 10) {
-                if let next = state.upNext {
+                let steps = state.nextSteps
+                if !steps.isEmpty {
+                    let index = state.upNextIndex % steps.count
+                    let step = steps[index]
                     Text("UP NEXT")
                         .font(DSFont.capsLabel())
                         .foregroundStyle(ds.dark ? Color.white.opacity(0.45) : Color.black.opacity(0.45))
                     Button {
-                        open(next.url)
+                        state.openNextStep(step)
                     } label: {
                         HStack(spacing: 5) {
-                            Text(next.title)
+                            Text(step.action)
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(ds.dark ? Color.white.opacity(0.78) : Color.black.opacity(0.75))
+                                .lineLimit(1)
+                                .fixedSize()
+                            Text(step.title)
                                 .font(DSFont.pill())
-                                .foregroundStyle(ds.dark ? Color.white.opacity(0.6) : Color.black.opacity(0.6))
+                                .foregroundStyle(ds.dark ? Color.white.opacity(0.55) : Color.black.opacity(0.55))
                                 .lineLimit(1)
                                 .truncationMode(.tail)
-                            Text(next.age.display)
+                            Text(step.age.display)
                                 .font(DSFont.pill())
-                                .foregroundStyle(next.age.isStale ? ds.attention : ds.textFaint)
+                                .foregroundStyle(step.age.isStale ? ds.attention : ds.textFaint)
+                                .fixedSize()
                         }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("\(next.title)\nOpen on GitHub")
+                    .help("\(step.action): \(step.title)\nOpen on GitHub")
+                    if steps.count > 1 {
+                        Button {
+                            state.showNextStep()
+                        } label: {
+                            HStack(spacing: 2) {
+                                Text("\(index + 1)/\(steps.count)")
+                                    .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 9, weight: .semibold))
+                            }
+                            .foregroundStyle(ds.textFaint)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .fixedSize()
+                        .help("Next suggestion")
+                        .accessibilityLabel("Next suggestion, \(index + 1) of \(steps.count)")
+                    }
                 } else {
                     // Not "All clear" until the badge's sections have loaded.
                     Text(state.hasLoaded ? "All clear ✓" : TabEmptyState.notLoadedText(state))
@@ -57,15 +83,6 @@ struct FooterView: View {
                 .help("Settings")
             }
             .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
-        }
-    }
-
-    /// Opening a mention from here marks it read, as its row does.
-    private func open(_ url: URL) {
-        state.open(url)
-        for case .mention(let mention) in state.inbox where mention.url == url {
-            state.markRead(mention)
-            break
         }
     }
 }

@@ -33,6 +33,11 @@ struct PanelRootView: View {
                 VStack(spacing: 0) {
                     TabBarView()
                     VStack(spacing: 0) {
+                        // The search row takes its line from the list, so the
+                        // panel keeps its size.
+                        if state.searchActive && state.activeTab != .stats {
+                            SearchBar()
+                        }
                         content
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                         if let notice = state.ssoNotice {

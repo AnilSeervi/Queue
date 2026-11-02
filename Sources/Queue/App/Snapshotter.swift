@@ -42,6 +42,20 @@ enum Snapshotter {
                          dark: dark, to: url.appendingPathComponent("panel-\(tab.rawValue)-done-\(suffix).png"))
                 }
                 state.expandedDone = []
+                // Searching "sla" in the Inbox, the first match selected.
+                state.activeTab = .inbox
+                state.searchText[.inbox] = "sla"
+                state.searchActive = true
+                state.selectedRowID = state.navigableRowIDs.first
+                snap(PanelRootView().environmentObject(state), dark: dark,
+                     to: url.appendingPathComponent("panel-inbox-search-\(suffix).png"))
+                state.endSearch()
+                // Keyboard selection (↓) on My PRs.
+                state.activeTab = .prs
+                state.selectedRowID = state.navigableRowIDs.dropFirst().first
+                snap(PanelRootView().environmentObject(state), dark: dark,
+                     to: url.appendingPathComponent("panel-prs-selected-\(suffix).png"))
+                state.selectedRowID = nil
                 // Hover actions, as if the pointer were on the rows.
                 for (name, tab, preview) in hoverPreviews {
                     state.activeTab = tab
@@ -92,6 +106,7 @@ enum Snapshotter {
             ("inbox-hover", .inbox, RowPreview(hovered: ["rr-4821", "m-4790"], busy: opening)),
             ("prs-hover", .prs, RowPreview(hovered: ["pr-391", "pr-2215"])),
             ("prs-merge", .prs, RowPreview(hovered: ["pr-2231"], confirmingMerge: ["pr-2231"])),
+            ("prs-nudge", .prs, RowPreview(hovered: ["pr-4830"])),
         ]
     }
 

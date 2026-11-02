@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusController: StatusItemController!
     private var panel: FloatingPanel?
     private var hotKey: HotKey?
+    private var keyMonitor: Any?
 
     /// Accessory apps have no menu bar, so ⌘V/⌘C/⌘A/⌘Z never reach text
     /// fields (the token field) unless a main menu declares them. The menu
@@ -124,9 +125,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.onClose = { [weak self, weak panel] in
             guard let self, self.panel === panel else { return }
             self.panel = nil
+            self.removeKeyMonitor()
         }
         self.panel = panel
         panel.show(relativeTo: statusController.button)
+        installKeyMonitor(for: panel)
+    }
+
+    /// The panel's keyboard (search, ↑/↓, ↩, ⌘B, ⌘O, ⌘1–⌘4, Esc), only
+    /// while it's open and only for its own key presses.
+    private func installKeyMonitor(for panel: FloatingPanel) {
+        removeKeyMonitor()
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self, weak panel] event in
+            // Local monitors run on the main thread.
+            let handled: Bool = MainActor.assumeIsolated {
+                guard let self, let panel, event.window === panel else { return false }
+                switch self.state.handlePanelKey(event, fieldFocused: FocusingSearchField.isEditing(in: panel)) {
+                case .consumed:
+                    return true
+                case .passThrough:
+                    return false
+                case .typeIntoSearch(let text):
+                    self.state.showSearch(typing: text)
+                    return true
+                }
+            }
+            return handled ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        keyMonitor = nil
     }
 
     func closePanel() {

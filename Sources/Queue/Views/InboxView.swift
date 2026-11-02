@@ -20,13 +20,15 @@ struct InboxView: View {
 
     var body: some View {
         let ds = DS(scheme)
-        let entries = state.inbox
+        let entries = state.searchedInbox
+        let done = state.searched(state.doneInbox)
 
         VStack(spacing: 0) {
             if entries.isEmpty {
-                EmptyListTab(tab: .inbox, sections: Self.sections, text: "Nothing needs you ✓") {
+                EmptyListTab(tab: .inbox, sections: Self.sections,
+                             text: state.isSearching ? "No matches for “\(state.query.raw)”" : "Nothing needs you ✓") {
                     approvedLine
-                    DoneSection(tab: .inbox, items: state.doneInbox)
+                    DoneSection(tab: .inbox, items: done)
                 }
             } else {
                 ListScrollView(tab: .inbox) {
@@ -35,15 +37,15 @@ struct InboxView: View {
                         ForEach(stackSegments(group.items, stack: Self.stack)) { segment in
                             switch segment {
                             case .single(let entry):
-                                row(for: entry, ds: ds)
+                                row(for: entry, ds: ds).id(entry.id)
                             case .stack(let stack, let layers):
                                 StackHeader(stack: stack)
-                                ForEach(layers) { entry in row(for: entry, ds: ds) }
+                                ForEach(layers) { entry in row(for: entry, ds: ds).id(entry.id) }
                             }
                         }
                     }
                     approvedLine
-                    DoneSection(tab: .inbox, items: state.doneInbox)
+                    DoneSection(tab: .inbox, items: done)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
@@ -73,6 +75,9 @@ struct InboxView: View {
                 title: request.title,
                 meta: request.meta,
                 pinned: pinned(entry, branch: request.branchRef),
+                selected: state.selectedRowID == entry.id,
+                muteRepo: request.repo,
+                onMute: { state.mute(request.repo) },
                 onOpen: { state.open(request.url) },
                 leading: {
                     PRGlyph(color: request.age.isStale ? ds.attention : ds.success)
@@ -105,6 +110,9 @@ struct InboxView: View {
                 title: mention.title,
                 meta: mention.meta,
                 pinned: pinned(entry, branch: nil),
+                selected: state.selectedRowID == entry.id,
+                muteRepo: mention.repo,
+                onMute: { state.mute(mention.repo) },
                 onOpen: { open(mention) },
                 leading: {
                     if let author = mention.author {

@@ -48,6 +48,26 @@ struct StackHeader: View {
     }
 }
 
+/// Unresolved review threads on your PR: "💬 3".
+struct ThreadsChip: View {
+    var count: Int
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let ds = DS(scheme)
+        HStack(spacing: 2) {
+            Image(systemName: "bubble.left")
+                .font(.system(size: 9, weight: .medium))
+            Text("\(count)")
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
+        }
+        .foregroundStyle(ds.textFaint)
+        .help("\(count) unresolved review thread\(count == 1 ? "" : "s")")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(count) unresolved review thread\(count == 1 ? "" : "s")")
+    }
+}
+
 /// A stacked PR's place, "2/3" (1 is closest to the base branch).
 struct StackPositionChip: View {
     var stack: StackInfo
@@ -79,6 +99,11 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
     @ViewBuilder var trailing: () -> Trailing
     @ViewBuilder var actions: () -> Actions
     var pinned: Bool
+    /// The keyboard selection (↑/↓): looks hovered, actions showing.
+    var selected: Bool
+    /// Right-click → "Mute <repo>"; nil = no menu.
+    var muteRepo: RepoRef?
+    var onMute: (() -> Void)?
     var onOpen: () -> Void
 
     @State private var hovered = false
@@ -88,6 +113,9 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
         title: String,
         meta: String,
         pinned: Bool = false,
+        selected: Bool = false,
+        muteRepo: RepoRef? = nil,
+        onMute: (() -> Void)? = nil,
         onOpen: @escaping () -> Void,
         @ViewBuilder leading: @escaping () -> Leading,
         @ViewBuilder titleAccessory: @escaping () -> TitleAccessory = { EmptyView() },
@@ -98,6 +126,9 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
         self.title = title
         self.meta = meta
         self.pinned = pinned
+        self.selected = selected
+        self.muteRepo = muteRepo
+        self.onMute = onMute
         self.onOpen = onOpen
         self.leading = leading
         self.titleAccessory = titleAccessory
@@ -108,7 +139,7 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
 
     var body: some View {
         let ds = DS(scheme)
-        let active = hovered || pinned
+        let active = hovered || pinned || selected
         HStack(alignment: .center, spacing: 10) {
             leading()
                 .frame(width: 15, height: 15)
@@ -164,6 +195,12 @@ struct QueueRow<Leading: View, TitleAccessory: View, MetaAccessory: View, Traili
         .onHover { inside in
             withAnimation(.easeOut(duration: 0.12)) { hovered = inside }
         }
+        .contextMenu {
+            if let muteRepo, let onMute {
+                Button("Mute \(muteRepo.fullName)", action: onMute)
+            }
+        }
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -427,21 +464,56 @@ struct MergedSummaryLine: View {
     }
 }
 
-/// Inline error line: a failed action, or a refresh that failed and left
-/// the last good data showing.
-struct InlineErrorLine: View {
+/// "Nudged @ana on #2232", after a nudge.
+struct NudgedSummaryLine: View {
     var text: String
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        Text(text)
-            .font(DSFont.meta())
-            .foregroundStyle(DS(scheme).danger)
-            .lineLimit(3)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
-            .help(text)
+        let ds = DS(scheme)
+        HStack(spacing: 6) {
+            Image(systemName: "hand.wave")
+                .font(.system(size: 10, weight: .medium))
+            Text(text)
+                .font(DSFont.meta())
+                .lineLimit(1)
+        }
+        .foregroundStyle(ds.textMeta)
+        .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
+    }
+}
+
+/// Inline error line: a failed action, or a refresh that failed and left
+/// the last good data showing.
+struct InlineErrorLine: View {
+    var text: String
+    /// Offered for a failed refresh.
+    var retry: (() -> Void)? = nil
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let ds = DS(scheme)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(text)
+                .font(DSFont.meta())
+                .foregroundStyle(ds.danger)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(text)
+            if let retry {
+                Button(action: retry) {
+                    Text("Retry")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(ds.textPrimary)
+                        .padding(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                        .background(ds.control, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("Refresh now")
+            }
+        }
+        .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
     }
 }
 
@@ -582,6 +654,10 @@ struct ListScrollView<Content: View>: View {
                     .padding(.bottom, 6)
             }
             .defaultScrollAnchor(scrollAnchor)
+            .onChange(of: state.selectedRowID) { _, id in
+                guard let id, state.activeTab == tab else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(id) }
+            }
             .onChange(of: state.expandedDone.contains(tab)) { _, opened in
                 guard opened else { return }
                 // After the rows have opened: until then the content isn't
@@ -762,7 +838,7 @@ struct TabStatusLines: View {
 
     var body: some View {
         if let error = state.inlineError {
-            InlineErrorLine(text: error)
+            InlineErrorLine(text: error, retry: state.canRetryRefresh ? { Task { await state.refresh() } } : nil)
         }
     }
 }
